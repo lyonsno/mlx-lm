@@ -41,6 +41,7 @@ class ModelArgs(BaseModelArgs):
     num_attention_groups: int
     head_dim: int
     intermediate_size: int
+    num_nextn_predict_layers: int = 0
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     rope_scaling: Optional[Dict] = None
@@ -189,7 +190,8 @@ class Step3p5Attention(nn.Module):
         dim = args.hidden_size
 
         layer_types = args.layer_types or []
-        if layer_types:
+        has_layer_type = layer_idx < len(layer_types)
+        if layer_types and has_layer_type:
             self.is_sliding = layer_types[layer_idx] == "sliding_attention"
         else:
             self.is_sliding = layer_idx % 2 == 0
@@ -218,7 +220,7 @@ class Step3p5Attention(nn.Module):
 
         rope_theta = args.rope_theta
         if isinstance(rope_theta, list):
-            rope_theta = rope_theta[layer_idx]
+            rope_theta = rope_theta[layer_idx] if layer_idx < len(rope_theta) else 10000.0
 
         partial_rotary_factor = 1.0
         if args.partial_rotary_factors and layer_idx < len(args.partial_rotary_factors):
@@ -227,7 +229,7 @@ class Step3p5Attention(nn.Module):
         rope_dims = int(self.head_dim * partial_rotary_factor)
 
         yarn_only_types = args.yarn_only_types or []
-        layer_type = layer_types[layer_idx] if layer_types else "full_attention"
+        layer_type = layer_types[layer_idx] if has_layer_type else "full_attention"
         if yarn_only_types and layer_type not in yarn_only_types:
             rope_scaling = None
         else:
@@ -324,18 +326,71 @@ class Step3p5DecoderLayer(nn.Module):
         return h + r
 
 
+class Step3p5MTP(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.num_predict_layers = args.num_nextn_predict_layers
+        self.sliding_window = args.sliding_window
+        self.hidden_norm = ZeroCenteredRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.emb_norm = ZeroCenteredRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.linear_proj = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
+        self.predictor_layers = [
+            Step3p5DecoderLayer(args, layer_idx=args.num_hidden_layers + i)
+            for i in range(self.num_predict_layers)
+        ]
+        self.norm = ZeroCenteredRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+        self._swa_idx = next(
+            (i for i, l in enumerate(self.predictor_layers) if l.is_sliding), None
+        )
+        self._full_idx = next(
+            (i for i, l in enumerate(self.predictor_layers) if not l.is_sliding), None
+        )
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        token_embeddings: mx.array,
+        cache: Optional[List[Any]] = None,
+    ) -> mx.array:
+        h = mx.concatenate(
+            [self.hidden_norm(hidden_states), self.emb_norm(token_embeddings)], axis=-1
+        )
+        h = self.linear_proj(h)
+
+        if cache is None:
+            cache = [None] * self.num_predict_layers
+
+        full_mask = None
+        swa_mask = None
+        if self._full_idx is not None:
+            full_mask = create_attention_mask(h, cache[self._full_idx])
+        if self._swa_idx is not None:
+            swa_mask = create_attention_mask(
+                h, cache[self._swa_idx], window_size=self.sliding_window
+            )
+
+        for layer, c in zip(self.predictor_layers, cache):
+            mask = swa_mask if layer.is_sliding else full_mask
+            h = layer(h, mask=mask, cache=c)
+
+        return self.norm(h)
+
+
 class Step3p5Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.vocab_size = args.vocab_size
         self.num_layers = args.num_hidden_layers
+        self.num_mtp_layers = args.num_nextn_predict_layers
 
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
             Step3p5DecoderLayer(args, layer_idx)
             for layer_idx in range(args.num_hidden_layers)
         ]
+        self.mtp = Step3p5MTP(args) if self.num_mtp_layers > 0 else None
         self.norm = ZeroCenteredRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
         self._swa_idx = next(
@@ -396,7 +451,67 @@ class Model(nn.Module):
     def make_cache(self):
         return [KVCache() for _ in self.layers]
 
+    def make_mtp_cache(self):
+        if self.model.mtp is None:
+            return []
+        return [KVCache() for _ in self.model.mtp.predictor_layers]
+
+    def mtp_logits(
+        self,
+        hidden_states: mx.array,
+        draft_tokens: mx.array,
+        cache: Optional[List[Any]] = None,
+    ) -> mx.array:
+        if self.model.mtp is None:
+            raise ValueError("MTP layers are not enabled for this model.")
+        token_embeddings = self.model.embed_tokens(draft_tokens)
+        out = self.model.mtp(hidden_states, token_embeddings, cache=cache)
+        return self.lm_head(out)
+
     def sanitize(self, weights):
+        def _infer_mtp_layer_count():
+            max_mtp_idx = -1
+            for k in weights:
+                if k.startswith("model.mtp.predictor_layers."):
+                    parts = k.split(".")
+                    if len(parts) > 3 and parts[3].isdigit():
+                        max_mtp_idx = max(max_mtp_idx, int(parts[3]))
+                if "model.layers." not in k:
+                    continue
+                parts = k.split(".")
+                if len(parts) > 2 and parts[2].isdigit():
+                    layer_idx = int(parts[2])
+                    if layer_idx >= self.args.num_hidden_layers:
+                        max_mtp_idx = max(
+                            max_mtp_idx, layer_idx - self.args.num_hidden_layers
+                        )
+            return max_mtp_idx + 1
+
+        def _has_mtp_weights():
+            if any(".mtp" in k for k in weights):
+                return True
+            for k in weights:
+                if "model.layers." not in k:
+                    continue
+                parts = k.split(".")
+                if len(parts) > 2 and parts[2].isdigit():
+                    if int(parts[2]) >= self.args.num_hidden_layers:
+                        return True
+            return False
+
+        inferred_mtp_layers = _infer_mtp_layer_count()
+        if self.args.num_nextn_predict_layers == 0 and inferred_mtp_layers > 0:
+            self.args.num_nextn_predict_layers = inferred_mtp_layers
+            self.model.num_mtp_layers = inferred_mtp_layers
+            self.model.mtp = Step3p5MTP(self.args)
+
+        if self.model.mtp is not None and not _has_mtp_weights():
+            # Keep compatibility with already-converted checkpoints where
+            # num_nextn_predict_layers is set in config but MTP tensors were removed.
+            self.model.mtp = None
+            self.model.num_mtp_layers = 0
+            self.args.num_nextn_predict_layers = 0
+
         remappings = [
             (".moe.gate_proj.", ".mlp.switch_mlp.gate_proj."),
             (".moe.up_proj.", ".mlp.switch_mlp.up_proj."),
@@ -412,13 +527,19 @@ class Model(nn.Module):
 
         new_weights = {}
         for k, v in weights.items():
-            if ".mtp" in k:
-                continue
             if "model.layers." in k:
                 parts = k.split(".")
                 if len(parts) > 2 and parts[2].isdigit():
-                    if int(parts[2]) >= self.args.num_hidden_layers:
-                        continue
+                    layer_idx = int(parts[2])
+                    if layer_idx >= self.args.num_hidden_layers:
+                        mtp_idx = layer_idx - self.args.num_hidden_layers
+                        if mtp_idx < self.args.num_nextn_predict_layers:
+                            parts[1] = "mtp"
+                            parts[2] = "predictor_layers"
+                            parts.insert(3, str(mtp_idx))
+                            k = ".".join(parts)
+                        else:
+                            continue
 
             for src, dst in remappings:
                 if src in k and dst not in k:
