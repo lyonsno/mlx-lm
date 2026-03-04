@@ -699,6 +699,43 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertIsNone(miss)
         self.assertEqual(rem3, long_tokens)
 
+    def test_mixed_cache_longer_prefix_reuse_misses_after_decode_rotation(self):
+        lru = LRUPromptCache(max_size=10)
+        model_key = ("step3p5-tiny", None, None)
+        model = self._make_tiny_step3p5_model()
+
+        prompt_tokens = list(range(1, 13))
+        decoded_tokens = prompt_tokens + [99]
+        shorter_tokens = prompt_tokens[:8]
+
+        prompt_array = mx.array([prompt_tokens], dtype=mx.int32)
+        decode_array = mx.array([[decoded_tokens[-1]]], dtype=mx.int32)
+
+        long_cache = model.make_cache()
+        mx.eval(model(prompt_array, cache=long_cache))
+        mx.eval(model(decode_array, cache=long_cache))
+
+        # After decode-time in-place rotation, offsets can exceed backing
+        # storage length, so older history is unrecoverable for rewind.
+        rotating_layers = [c for c in long_cache if isinstance(c, RotatingKVCache)]
+        self.assertGreater(len(rotating_layers), 0)
+        for sliding in rotating_layers:
+            self.assertGreater(sliding.offset, sliding.keys.shape[2])
+            self.assertEqual(sliding.size(), sliding.max_size)
+            self.assertFalse(sliding.is_trimmable())
+
+        lru.insert_cache(model_key, decoded_tokens, long_cache)
+        reused_cache, remaining = lru.fetch_nearest_cache(model_key, shorter_tokens)
+        self.assertIsNone(reused_cache)
+        self.assertEqual(remaining, shorter_tokens)
+
+        # The longer entry itself should remain available as an exact hit.
+        exact_cache, exact_remaining = lru.fetch_nearest_cache(
+            model_key, decoded_tokens
+        )
+        self.assertIsNotNone(exact_cache)
+        self.assertEqual(exact_remaining, [])
+
 
 if __name__ == "__main__":
     unittest.main()
