@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
+import copy
 import http
 import io
 import json
@@ -9,7 +10,7 @@ import unittest
 import mlx.core as mx
 import requests
 
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
 from mlx_lm.utils import load
 
@@ -419,6 +420,45 @@ class TestKeepalive(unittest.TestCase):
 
 
 class TestLRUPromptCache(unittest.TestCase):
+    def _make_tiny_step3p5_model(self):
+        from mlx_lm.models import step3p5
+
+        # Keep this config minimal and centralized so schema churn in one place
+        # does not ripple through multiple cache behavior assertions.
+        args = step3p5.ModelArgs.from_dict(
+            {
+                "model_type": "step3p5",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "vocab_size": 256,
+                "num_attention_heads": 4,
+                "num_attention_groups": 2,
+                "head_dim": 32,
+                "intermediate_size": 256,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": [10000.0, 10000.0, 10000.0, 10000.0],
+                "sliding_window": 4,
+                "layer_types": [
+                    "full_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "partial_rotary_factors": [1.0, 1.0, 1.0, 1.0],
+                "attention_other_setting": {
+                    "num_attention_heads": 4,
+                    "num_attention_groups": 2,
+                },
+                "use_head_wise_attn_gate": True,
+                "moe_num_experts": 4,
+                "moe_top_k": 2,
+                "moe_intermediate_size": 128,
+                "share_expert_dim": 128,
+                "moe_layers_enum": "1,2,3",
+            }
+        )
+        return step3p5.Model(args)
+
     def test_caching(self):
         cache = LRUPromptCache(max_size=10)
 
@@ -511,6 +551,153 @@ class TestLRUPromptCache(unittest.TestCase):
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
+
+    def test_mixed_cache_longer_prefix_reuse_when_rotating_cache_is_full(self):
+        lru = LRUPromptCache(max_size=10)
+        model_key = ("step3p5-tiny", None, None)
+
+        model = self._make_tiny_step3p5_model()
+
+        long_tokens = list(range(1, 13))
+        shorter_tokens = long_tokens[:8]
+        expected_cached_prefix = len(shorter_tokens) - 1
+        continuation_tokens = [42, 43, 44, 45]
+
+        long_array = mx.array([long_tokens], dtype=mx.int32)
+        shorter_array = mx.array([shorter_tokens], dtype=mx.int32)
+        remaining_array = mx.array([shorter_tokens[-1:]], dtype=mx.int32)
+
+        # Rotating cache is saturated and non-trimmable via its public contract.
+        long_cache = model.make_cache()
+        mx.eval(model(long_array, cache=long_cache))
+        stored_snapshot = copy.deepcopy(long_cache)
+
+        rotating_layers = [c for c in long_cache if isinstance(c, RotatingKVCache)]
+        self.assertGreater(len(rotating_layers), 0)
+        for sliding in rotating_layers:
+            self.assertEqual(sliding.size(), sliding.max_size)
+            self.assertFalse(sliding.is_trimmable())
+
+        lru.insert_cache(model_key, long_tokens, long_cache)
+        reused_cache, remaining = lru.fetch_nearest_cache(model_key, shorter_tokens)
+
+        # Desired behavior for mixed-cache models:
+        # still return a reusable cache object and a short suffix to process,
+        # rather than dropping to a full miss.
+        self.assertIsNotNone(reused_cache)
+        self.assertEqual(len(reused_cache), len(model.layers))
+        self.assertEqual(remaining, shorter_tokens[-1:])
+
+        # Longer-prefix lookups use read-only access today, so the long entry
+        # should still be reusable as an exact match after a shorter lookup.
+        exact_cache, exact_remaining = lru.fetch_nearest_cache(model_key, long_tokens)
+        self.assertIsNotNone(exact_cache)
+        self.assertEqual(exact_remaining, [])
+
+        # Exact long hit should remain intact compared to original stored state.
+        self.assertEqual(
+            [c.offset for c in exact_cache], [c.offset for c in stored_snapshot]
+        )
+        for fetched, snap in zip(exact_cache, stored_snapshot):
+            self.assertIsInstance(fetched, (KVCache, RotatingKVCache))
+            self.assertIsInstance(snap, (KVCache, RotatingKVCache))
+            if isinstance(fetched, RotatingKVCache):
+                self.assertEqual(fetched.max_size, snap.max_size)
+                self.assertEqual(fetched.keep, snap.keep)
+            if isinstance(fetched, (KVCache, RotatingKVCache)):
+                fk, fv = fetched.state
+                sk, sv = snap.state
+                self.assertTrue(mx.array_equal(fk, sk))
+                self.assertTrue(mx.array_equal(fv, sv))
+
+        # If a cache is returned, it should represent the common prefix
+        # (all shorter tokens except the final carry token).
+        self.assertEqual(
+            [c.offset for c in reused_cache],
+            [expected_cached_prefix] * len(reused_cache),
+        )
+
+        # Full-attention caches must match a direct prefix prefill baseline.
+        prefix_array = mx.array([shorter_tokens[:-1]], dtype=mx.int32)
+        baseline_prefix_cache = model.make_cache()
+        mx.eval(model(prefix_array, cache=baseline_prefix_cache))
+        full_attention_indices = [
+            i for i, layer in enumerate(model.layers) if not layer.is_sliding
+        ]
+        for idx in full_attention_indices:
+            rk, rv = reused_cache[idx].state
+            bk, bv = baseline_prefix_cache[idx].state
+            self.assertEqual(rk.shape[2], expected_cached_prefix)
+            self.assertEqual(rv.shape[2], expected_cached_prefix)
+            self.assertTrue(mx.allclose(rk, bk, rtol=1e-5, atol=1e-5))
+            self.assertTrue(mx.allclose(rv, bv, rtol=1e-5, atol=1e-5))
+
+        # Sliding cache should preserve a bounded, non-empty window.
+        sliding_indices = [
+            i for i, layer in enumerate(model.layers) if layer.is_sliding
+        ]
+        for idx in sliding_indices:
+            self.assertGreater(reused_cache[idx].size(), 0)
+            self.assertLessEqual(reused_cache[idx].size(), reused_cache[idx].max_size)
+
+        # Behavior-level check: short multi-token continuation from the reused
+        # cache should match a baseline cache built from the shorter prompt.
+        baseline_cache = model.make_cache()
+        mx.eval(model(shorter_array, cache=baseline_cache))
+
+        # Process the remaining carry token to align with the full shorter prompt.
+        mx.eval(model(remaining_array, cache=reused_cache))
+        self.assertEqual(
+            [c.offset for c in reused_cache], [c.offset for c in baseline_cache]
+        )
+
+        for tok in continuation_tokens:
+            tok_array = mx.array([[tok]], dtype=mx.int32)
+            reused_logits = model(tok_array, cache=reused_cache)
+            baseline_logits = model(tok_array, cache=baseline_cache)
+            mx.eval(reused_logits, baseline_logits)
+            self.assertTrue(
+                mx.allclose(reused_logits, baseline_logits, rtol=1e-5, atol=1e-5)
+            )
+            self.assertEqual(
+                [c.offset for c in reused_cache], [c.offset for c in baseline_cache]
+            )
+
+    def test_mixed_cache_longer_prefix_reuse_preserves_refcounted_long_entry(self):
+        lru = LRUPromptCache(max_size=10)
+        model_key = ("step3p5-tiny", None, None)
+        model = self._make_tiny_step3p5_model()
+
+        long_tokens = list(range(1, 13))
+        shorter_tokens = long_tokens[:8]
+
+        long_array = mx.array([long_tokens], dtype=mx.int32)
+        long_cache = model.make_cache()
+        mx.eval(model(long_array, cache=long_cache))
+
+        # Store two references to the same long cache entry.
+        lru.insert_cache(model_key, long_tokens, long_cache)
+        lru.insert_cache(model_key, long_tokens, long_cache)
+
+        # Mixed longer->shorter lookup should return a reusable cache.
+        # It should not consume one of the long-entry references.
+        reused_cache, remaining = lru.fetch_nearest_cache(model_key, shorter_tokens)
+        self.assertIsNotNone(reused_cache)
+        self.assertEqual(remaining, shorter_tokens[-1:])
+
+        # If longer->shorter lookup is non-destructive, we should still get
+        # two exact hits from the refcounted long entry.
+        hit1, rem1 = lru.fetch_nearest_cache(model_key, long_tokens)
+        self.assertIsNotNone(hit1)
+        self.assertEqual(rem1, [])
+
+        hit2, rem2 = lru.fetch_nearest_cache(model_key, long_tokens)
+        self.assertIsNotNone(hit2)
+        self.assertEqual(rem2, [])
+
+        miss, rem3 = lru.fetch_nearest_cache(model_key, long_tokens)
+        self.assertIsNone(miss)
+        self.assertEqual(rem3, long_tokens)
 
 
 if __name__ == "__main__":
