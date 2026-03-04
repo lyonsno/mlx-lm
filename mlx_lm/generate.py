@@ -466,6 +466,159 @@ def generate_step(
         n += 1
 
 
+def mtp_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    prompt_cache: Optional[Any] = None,
+    mtp_cache: Optional[Any] = None,
+    prefill_step_size: int = 512,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
+    """
+    A generator producing token ids with MTP-1 draft-and-verify decoding.
+
+    This path is intended for models that expose ``mtp_logits`` and either
+    ``forward_with_hidden`` or ``model`` + ``lm_head``.
+
+    Args:
+        prompt (mx.array): The input prompt.
+        model (nn.Module): The model to use for generation.
+        max_tokens (int): Maximum tokens to generate. Default: ``256``.
+        sampler (Callable[[mx.array], mx.array], optional): Sampler applied to
+          log probabilities. Default: ``argmax``.
+        prompt_cache (List[Any], optional): Main model prompt cache.
+        mtp_cache (List[Any], optional): MTP branch cache.
+        prefill_step_size (int): Prompt prefill chunk size.
+        kv_bits (int, optional): KV cache quantization bits.
+        kv_group_size (int): KV cache quantization group size.
+        quantized_kv_start (int): Step to begin KV cache quantization.
+
+    Yields:
+        Tuple[mx.array, mx.array, bool]:
+          Token id, token logprobs, and whether token came from MTP draft.
+    """
+    if len(prompt) == 0:
+        raise ValueError("prompt must contain at least one token for MTP generation.")
+    if not hasattr(model, "mtp_logits"):
+        raise ValueError(
+            "Model does not expose mtp_logits required for MTP generation."
+        )
+
+    y = prompt.astype(mx.uint32)
+
+    if prompt_cache is None:
+        prompt_cache = cache.make_prompt_cache(model)
+
+    if mtp_cache is None:
+        if not hasattr(model, "make_mtp_cache"):
+            raise ValueError(
+                "mtp_cache is required when model does not expose make_mtp_cache."
+            )
+        mtp_cache = model.make_mtp_cache()
+    if not cache.can_trim_prompt_cache(mtp_cache):
+        raise ValueError(
+            "MTP generation requires trimmable mtp_cache for rejection handling."
+        )
+
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+
+    def _forward_with_hidden(input_tokens: mx.array):
+        if hasattr(model, "forward_with_hidden"):
+            return model.forward_with_hidden(input_tokens, prompt_cache)
+
+        # Step3.5-style fallback where the decoder and LM head are exposed.
+        if hasattr(model, "model") and hasattr(model, "lm_head"):
+            hidden = model.model(input_tokens, cache=prompt_cache)
+            logits = model.lm_head(hidden)
+            return logits, hidden
+
+        logits = model(input_tokens, cache=prompt_cache)
+        return logits, None
+
+    def _sample_logits(logits: mx.array):
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        sampled = sampler(logprobs)
+        return sampled, logprobs
+
+    def _prefill(tokens: mx.array):
+        while tokens.size > prefill_step_size:
+            _forward_with_hidden(tokens[:prefill_step_size][None])
+            quantize_cache_fn(prompt_cache)
+            mx.eval([c.state for c in prompt_cache])
+            tokens = tokens[prefill_step_size:]
+            mx.clear_cache()
+        return tokens
+
+    with mx.stream(generation_stream):
+        y = _prefill(y)
+        verify_logits, hidden_states = _forward_with_hidden(y[None])
+        quantize_cache_fn(prompt_cache)
+
+    ntoks = 0
+    while ntoks < max_tokens:
+        if hidden_states is None:
+            raise ValueError(
+                "MTP generation requires hidden states. Provide a model with "
+                "forward_with_hidden or with model + lm_head attributes."
+            )
+
+        with mx.stream(generation_stream):
+            verify_token, verify_logprobs = _sample_logits(verify_logits[:, -1, :])
+
+            draft_inputs = y[-1:][None]
+            draft_logits = model.mtp_logits(
+                hidden_states[:, -1:, :], draft_inputs, mtp_cache
+            )
+            quantize_cache_fn(mtp_cache)
+            draft_token, _ = _sample_logits(draft_logits[:, -1, :])
+
+        verify_token = int(verify_token.item())
+        draft_token = int(draft_token.item())
+        accepted = draft_token == verify_token
+
+        if accepted:
+            out_token = draft_token
+            # Keep logprob contract aligned with autoregressive/speculative paths:
+            # reported logprobs come from verifier/main-model distribution.
+            out_logprobs = verify_logprobs.squeeze(0)
+            from_draft = True
+        else:
+            out_token = verify_token
+            out_logprobs = verify_logprobs.squeeze(0)
+            from_draft = False
+            cache.trim_prompt_cache(mtp_cache, 1)
+
+        next_y = mx.array([out_token], mx.uint32)
+
+        # Prefetch one verification pass per emitted token. This preserves
+        # autoregressive context progression on rejection paths.
+        with mx.stream(generation_stream):
+            next_verify_logits, next_hidden_states = _forward_with_hidden(next_y[None])
+            quantize_cache_fn(prompt_cache)
+
+        mx.async_eval(out_logprobs)
+        yield out_token, out_logprobs, from_draft
+
+        y = next_y
+        verify_logits = next_verify_logits
+        hidden_states = next_hidden_states
+        ntoks += 1
+        if ntoks % 256 == 0:
+            mx.clear_cache()
+
+
 def speculative_generate_step(
     prompt: mx.array,
     model: nn.Module,
