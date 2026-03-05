@@ -1,8 +1,11 @@
 # Copyright © 2024 Apple Inc.
 
+import importlib
 import random
+import sys
 import unittest
 from typing import List
+from unittest.mock import patch
 
 import mlx.core as mx
 
@@ -12,12 +15,168 @@ from mlx_lm.generate import (
     batch_generate,
     generate,
     generate_step,
+    maybe_quantize_kv_cache,
     speculative_generate_step,
     stream_generate,
 )
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
+
+generate_module = importlib.import_module("mlx_lm.generate")
+
+
+class TestKVBitsCoverage(unittest.TestCase):
+    def test_maybe_quantize_kv_cache_honors_threshold_and_none_bits(self):
+        class QuantizedCache:
+            def __init__(self, bits, group_size):
+                self.bits = bits
+                self.group_size = group_size
+
+        class QuantizableCache:
+            def __init__(self, offset):
+                self.offset = offset
+                self.calls = []
+
+            def to_quantized(self, group_size, bits):
+                self.calls.append((group_size, bits))
+                return QuantizedCache(bits=bits, group_size=group_size)
+
+        class NonQuantizableCache:
+            def __init__(self, offset):
+                self.offset = offset
+
+        low_offset = QuantizableCache(offset=3)
+        high_offset = QuantizableCache(offset=5)
+        no_method = NonQuantizableCache(offset=99)
+        prompt_cache = [low_offset, high_offset, no_method]
+
+        maybe_quantize_kv_cache(
+            prompt_cache,
+            quantized_kv_start=5,
+            kv_group_size=32,
+            kv_bits=None,
+        )
+        self.assertEqual(low_offset.calls, [])
+        self.assertEqual(high_offset.calls, [])
+        self.assertIs(prompt_cache[0], low_offset)
+        self.assertIs(prompt_cache[1], high_offset)
+        self.assertIs(prompt_cache[2], no_method)
+
+        maybe_quantize_kv_cache(
+            prompt_cache,
+            quantized_kv_start=5,
+            kv_group_size=32,
+            kv_bits=4,
+        )
+        self.assertEqual(low_offset.calls, [])
+        self.assertEqual(high_offset.calls, [(32, 4)])
+        self.assertIs(prompt_cache[0], low_offset)
+        self.assertIs(prompt_cache[2], no_method)
+        self.assertIsInstance(prompt_cache[1], QuantizedCache)
+        self.assertEqual(prompt_cache[1].bits, 4)
+        self.assertEqual(prompt_cache[1].group_size, 32)
+
+    def test_generate_step_quantizes_eligible_cache_layer(self):
+        class QuantizedCache:
+            def __init__(self, bits, group_size):
+                self.bits = bits
+                self.group_size = group_size
+
+        class QuantizableCache:
+            def __init__(self, offset):
+                self.offset = offset
+                self.calls = []
+
+            def to_quantized(self, group_size, bits):
+                self.calls.append((group_size, bits))
+                return QuantizedCache(bits=bits, group_size=group_size)
+
+        class SimpleModel:
+            layers = [object()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                return mx.zeros((batch, seq_len, vocab_size), dtype=mx.float32)
+
+        cache_layer = QuantizableCache(offset=7)
+        prompt_cache = [cache_layer]
+        prompt = mx.array([1], dtype=mx.uint32)
+
+        token, _ = next(
+            generate_step(
+                prompt=prompt,
+                model=SimpleModel(),
+                prompt_cache=prompt_cache,
+                max_tokens=1,
+                kv_bits=6,
+                kv_group_size=16,
+                quantized_kv_start=4,
+            )
+        )
+
+        self.assertEqual(token, 0)
+        self.assertEqual(cache_layer.calls, [(16, 6)])
+        self.assertIsInstance(prompt_cache[0], QuantizedCache)
+        self.assertEqual(prompt_cache[0].bits, 6)
+        self.assertEqual(prompt_cache[0].group_size, 16)
+
+    def test_generate_main_raises_for_prompt_cache_kv_bits_mismatch(self):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "generate.py",
+                "--prompt-cache-file",
+                "dummy_cache.safetensors",
+                "--kv-bits",
+                "8",
+            ],
+        ), patch(
+            "mlx_lm.generate.load_prompt_cache",
+            return_value=(
+                [QuantizedKVCache(bits=4, group_size=32)],
+                {"tokenizer_config": "{}", "model": "dummy-model"},
+            ),
+        ), patch(
+            "mlx_lm.generate.load"
+        ) as load_mock:
+            with self.assertRaisesRegex(
+                ValueError,
+                "--kv-bits does not match the kv cache loaded from --prompt-cache-file.",
+            ):
+                generate_module.main()
+        self.assertFalse(load_mock.called)
+
+    def test_generate_main_raises_for_prompt_cache_kv_group_size_mismatch(self):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "generate.py",
+                "--prompt-cache-file",
+                "dummy_cache.safetensors",
+                "--kv-bits",
+                "4",
+                "--kv-group-size",
+                "16",
+            ],
+        ), patch(
+            "mlx_lm.generate.load_prompt_cache",
+            return_value=(
+                [QuantizedKVCache(bits=4, group_size=32)],
+                {"tokenizer_config": "{}", "model": "dummy-model"},
+            ),
+        ), patch(
+            "mlx_lm.generate.load"
+        ) as load_mock:
+            with self.assertRaisesRegex(
+                ValueError,
+                "--kv-group-size does not match the kv cache loaded from --prompt-cache-file.",
+            ):
+                generate_module.main()
+        self.assertFalse(load_mock.called)
 
 
 class TestGenerate(unittest.TestCase):
