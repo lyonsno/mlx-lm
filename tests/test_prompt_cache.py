@@ -18,6 +18,7 @@ from mlx_lm.models.cache import (
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
+    _BaseCache,
     load_prompt_cache,
     make_prompt_cache,
     save_prompt_cache,
@@ -396,6 +397,32 @@ class TestPromptCache(unittest.TestCase):
         c2_ex = merged_cache.extract(1)
         self.assertTrue(mx.array_equal(c2_ex[0][0], c2[0][0]))
         self.assertTrue(mx.array_equal(c2_ex[1].state[0], c2[1].state[0]))
+
+    def test_base_cache_legacy_can_rewind_uses_offset_hint(self):
+        class LegacyOffsetBoundCache(_BaseCache):
+            def __init__(self, offset):
+                self.offset = offset
+
+            @property
+            def nbytes(self):
+                return 1
+
+            def empty(self):
+                return self.offset == 0
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                trimmed = min(n, self.offset)
+                self.offset -= trimmed
+                return trimmed
+
+        cache = LegacyOffsetBoundCache(offset=2)
+        self.assertFalse(cache.can_rewind(3))
+        self.assertTrue(cache.can_rewind(2))
+        self.assertTrue(cache.rewind(2))
+        self.assertEqual(cache.offset, 0)
 
     def test_make_mask_with_cache(self):
         # For 1 time step with no cache, don't need a mask

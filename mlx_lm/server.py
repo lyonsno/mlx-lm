@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import logging
+import numbers
 import pickle
 import platform
 import socket
@@ -294,10 +295,21 @@ class LRUPromptCache:
         # Compatibility fallback for custom caches that only implement the
         # legacy is_trimmable()/trim() contract.
         is_trimmable = getattr(layer_cache, "is_trimmable", None)
-        if not callable(is_trimmable):
+        trim = getattr(layer_cache, "trim", None)
+        if not callable(is_trimmable) or not callable(trim):
             return False
         try:
-            return bool(is_trimmable())
+            if not bool(is_trimmable()):
+                return False
+            if num_to_trim <= 0:
+                return True
+
+            # If legacy cache exposes an offset, avoid deepcopy on guaranteed
+            # misses where trim can never satisfy the requested rewind.
+            offset = getattr(layer_cache, "offset", None)
+            if isinstance(offset, numbers.Integral):
+                return num_to_trim <= offset
+            return True
         except Exception:
             return False
 

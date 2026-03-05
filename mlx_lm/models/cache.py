@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import numbers
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
@@ -148,9 +149,21 @@ class _BaseCache:
         # Compatibility fallback for cache implementations that only define
         # the legacy is_trimmable()/trim() contract.
         try:
-            return bool(self.is_trimmable())
+            if not bool(self.is_trimmable()):
+                return False
         except Exception:
             return False
+
+        if num_to_trim <= 0:
+            return True
+
+        # If an offset is present, use it to fail closed before deepcopy on
+        # impossible rewinds.
+        offset = getattr(self, "offset", None)
+        if isinstance(offset, numbers.Integral):
+            return num_to_trim <= int(offset)
+
+        return True
 
     def rewind(self, num_to_trim: int) -> bool:
         if not self.can_rewind(num_to_trim):

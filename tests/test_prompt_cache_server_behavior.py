@@ -250,6 +250,49 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
         self.assertEqual(exact_remaining, [])
         self.assertEqual(exact_cache[0].offset, 4)
 
+    def test_legacy_offset_insufficient_safe_miss_skips_deepcopy(self):
+        class LegacyOffsetLimitedLayer:
+            def __init__(self):
+                self.offset = 2
+                self.trim_calls = []
+
+            @property
+            def nbytes(self):
+                return 1
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                self.trim_calls.append(n)
+                trimmed = min(n, self.offset)
+                self.offset -= trimmed
+                return trimmed
+
+            def __deepcopy__(self, memo):
+                raise AssertionError(
+                    "deepcopy should be skipped for offset-bounded legacy miss"
+                )
+
+        lru = LRUPromptCache(max_size=10)
+        model = ("legacy-offset-insufficient", None, None)
+        long_tokens = [1, 2, 3, 4]
+        shorter_tokens = [1, 2]
+
+        layer = LegacyOffsetLimitedLayer()
+        lru.insert_cache(model, long_tokens, [layer])
+
+        reused_cache, remaining = lru.fetch_nearest_cache(model, shorter_tokens)
+        self.assertIsNone(reused_cache)
+        self.assertEqual(remaining, shorter_tokens)
+        self.assertEqual(layer.trim_calls, [])
+        self.assertEqual(layer.offset, 2)
+
+        exact_cache, exact_remaining = lru.fetch_nearest_cache(model, long_tokens)
+        self.assertIsNotNone(exact_cache)
+        self.assertEqual(exact_remaining, [])
+        self.assertEqual(exact_cache[0].offset, 2)
+
     def test_composite_partial_trim_safe_miss_keeps_exact_entry_available(self):
         lru = LRUPromptCache(max_size=10)
         model = ("composite-partial", None, None)
