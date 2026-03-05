@@ -39,7 +39,7 @@ testable, and easy to merge.
 Note: split 1 and split 2 were intentionally combined in one commit to avoid
 an intermediate state where server and cache APIs diverged.
 
-### Split 3: Regression + Integration Coverage Pass (In Progress)
+### Split 3: Regression + Integration Coverage Pass (Landed)
 
 - Goal: lock down behavior contracts across mixed cache paths.
 - Scope:
@@ -53,8 +53,24 @@ an intermediate state where server and cache APIs diverged.
     - `tests/test_prompt_cache_server_behavior.py`
     - `tests/test_prompt_cache_server_rewind_internal.py`
     - shared helpers in `tests/prompt_cache_test_utils.py`.
+- Landed in: `6b935dc`
 - Expected PR label: `tests/mixed-cache-rewind-contracts`
 - Risk: low.
+- Merge dependency: Split 2.
+
+### Split 4: Legacy Precheck Perf + Compatibility Hardening (Landed)
+
+- Goal: fail fast on guaranteed legacy misses while preserving legacy rewind-only compatibility.
+- Scope:
+  - Add precheck fast-fail for impossible legacy rewinds (offset-bounded cases)
+    to avoid pointless deepcopy churn.
+  - Preserve compatibility for legacy layers implementing
+    `is_trimmable + rewind` without `trim`.
+  - Fail closed when legacy offset access itself is invalid.
+  - Add focused tests for these branches.
+- Landed in: `4517708`, `eb49b74`
+- Expected PR label: `perf/legacy-rewind-precheck-hardening`
+- Risk: low-medium (legacy/custom cache behavior).
 - Merge dependency: Split 2.
 
 ## Recently Landed Related Splits
