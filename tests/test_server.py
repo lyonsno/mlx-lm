@@ -727,23 +727,23 @@ class TestLRUPromptCache(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            def is_trimmable(self):
+            def can_rewind(self, n):
                 return True
 
-            def trim(self, n):
+            def rewind(self, n):
                 self.calls.append(n)
-                return n - 1
+                return False
 
         class FullTrimCache:
             def __init__(self):
                 self.calls = []
 
-            def is_trimmable(self):
+            def can_rewind(self, n):
                 return True
 
-            def trim(self, n):
+            def rewind(self, n):
                 self.calls.append(n)
-                return n
+                return True
 
         lru = LRUPromptCache(max_size=10)
         partial = PartialTrimCache()
@@ -759,23 +759,23 @@ class TestLRUPromptCache(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            def is_trimmable(self):
+            def can_rewind(self, n):
                 return True
 
-            def trim(self, n):
+            def rewind(self, n):
                 self.calls.append(n)
-                return n - 1
+                return False
 
         class FullTrimCache:
             def __init__(self):
                 self.calls = []
 
-            def is_trimmable(self):
+            def can_rewind(self, n):
                 return True
 
-            def trim(self, n):
+            def rewind(self, n):
                 self.calls.append(n)
-                return n
+                return True
 
         lru = LRUPromptCache(max_size=10)
         partial = PartialTrimCache()
@@ -792,23 +792,23 @@ class TestLRUPromptCache(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            def is_trimmable(self):
+            def can_rewind(self, n):
                 return True
 
-            def trim(self, n):
+            def rewind(self, n):
                 self.calls.append(n)
-                return n - 1
+                return False
 
         class FullTrimCache:
             def __init__(self):
                 self.calls = []
 
-            def is_trimmable(self):
+            def can_rewind(self, n):
                 return True
 
-            def trim(self, n):
+            def rewind(self, n):
                 self.calls.append(n)
-                return n
+                return True
 
         lru = LRUPromptCache(max_size=10)
         first_full = FullTrimCache()
@@ -822,8 +822,8 @@ class TestLRUPromptCache(unittest.TestCase):
 
     def test_fast_trim_path_fails_closed_on_partial_trim(self):
         class PartialTrimLayer:
-            total_calls = 0
-            trim_args = []
+            total_rewind_calls = 0
+            rewind_args = []
 
             def __init__(self):
                 self.offset = 4
@@ -832,18 +832,16 @@ class TestLRUPromptCache(unittest.TestCase):
             def nbytes(self):
                 return 1
 
-            def is_trimmable(self):
-                return True
+            def can_rewind(self, n):
+                return n <= self.offset
 
-            def trim(self, n):
-                type(self).total_calls += 1
-                type(self).trim_args.append(n)
-                trimmed = max(0, n - 1)
-                self.offset = max(0, self.offset - trimmed)
-                return trimmed
+            def rewind(self, n):
+                type(self).total_rewind_calls += 1
+                type(self).rewind_args.append(n)
+                return False
 
-        PartialTrimLayer.total_calls = 0
-        PartialTrimLayer.trim_args = []
+        PartialTrimLayer.total_rewind_calls = 0
+        PartialTrimLayer.rewind_args = []
 
         lru = LRUPromptCache(max_size=10)
         model = ("fast-trim", None, None)
@@ -858,8 +856,8 @@ class TestLRUPromptCache(unittest.TestCase):
         # Even on the all-trimmable fast path, partial trims must fail closed.
         self.assertIsNone(reused_cache)
         self.assertEqual(remaining, shorter_tokens)
-        self.assertEqual(PartialTrimLayer.total_calls, 1)
-        self.assertEqual(PartialTrimLayer.trim_args, [expected_num_to_trim])
+        self.assertEqual(PartialTrimLayer.total_rewind_calls, 1)
+        self.assertEqual(PartialTrimLayer.rewind_args, [expected_num_to_trim])
 
         # Safe miss should not consume or mutate the stored longer entry.
         exact_cache, exact_remaining = lru.fetch_nearest_cache(model, long_tokens)
@@ -873,7 +871,8 @@ class TestLRUPromptCache(unittest.TestCase):
         original_offset = missing_values.offset
         original_idx = missing_values._idx
         original_keys, _ = self._snapshot_cache_arrays(missing_values)
-        self.assertFalse(LRUPromptCache._rewind_rotating_cache(missing_values, 2))
+        self.assertFalse(missing_values.can_rewind(2))
+        self.assertFalse(missing_values.rewind(2))
         self.assertEqual(missing_values.offset, original_offset)
         self.assertEqual(missing_values._idx, original_idx)
         self.assertTrue(mx.array_equal(missing_values.keys, original_keys))
@@ -887,11 +886,8 @@ class TestLRUPromptCache(unittest.TestCase):
         original_keys, original_values = self._snapshot_cache_arrays(
             insufficient_offset
         )
-        self.assertFalse(
-            LRUPromptCache._rewind_rotating_cache(
-                insufficient_offset, insufficient_offset.offset + 1
-            )
-        )
+        self.assertFalse(insufficient_offset.can_rewind(insufficient_offset.offset + 1))
+        self.assertFalse(insufficient_offset.rewind(insufficient_offset.offset + 1))
         self.assertEqual(insufficient_offset.offset, original_offset)
         self.assertEqual(insufficient_offset._idx, original_idx)
         self.assertTrue(mx.array_equal(insufficient_offset.keys, original_keys))
@@ -908,9 +904,8 @@ class TestLRUPromptCache(unittest.TestCase):
         original_keys, original_values = self._snapshot_cache_arrays(
             unrecoverable_history
         )
-        self.assertFalse(
-            LRUPromptCache._rewind_rotating_cache(unrecoverable_history, 1)
-        )
+        self.assertFalse(unrecoverable_history.can_rewind(1))
+        self.assertFalse(unrecoverable_history.rewind(1))
         self.assertEqual(unrecoverable_history.offset, original_offset)
         self.assertEqual(unrecoverable_history._idx, original_idx)
         self.assertTrue(mx.array_equal(unrecoverable_history.keys, original_keys))
@@ -922,7 +917,8 @@ class TestLRUPromptCache(unittest.TestCase):
         original_offset = insufficient_idx.offset
         original_idx = insufficient_idx._idx
         original_keys, original_values = self._snapshot_cache_arrays(insufficient_idx)
-        self.assertFalse(LRUPromptCache._rewind_rotating_cache(insufficient_idx, 1))
+        self.assertFalse(insufficient_idx.can_rewind(1))
+        self.assertFalse(insufficient_idx.rewind(1))
         self.assertEqual(insufficient_idx.offset, original_offset)
         self.assertEqual(insufficient_idx._idx, original_idx)
         self.assertTrue(mx.array_equal(insufficient_idx.keys, original_keys))
@@ -935,7 +931,8 @@ class TestLRUPromptCache(unittest.TestCase):
         expected_prefix = total_tokens - trim_tokens
 
         rewound = self._build_real_rotating_cache(total_tokens=total_tokens)
-        self.assertTrue(LRUPromptCache._rewind_rotating_cache(rewound, trim_tokens))
+        self.assertTrue(rewound.can_rewind(trim_tokens))
+        self.assertTrue(rewound.rewind(trim_tokens))
 
         next_tok = mx.array([[[[99.0]]]], dtype=mx.float32)
         rewound.update_and_fetch(next_tok, next_tok)
@@ -956,7 +953,8 @@ class TestLRUPromptCache(unittest.TestCase):
         original_idx = cache._idx
         original_keys, original_values = self._snapshot_cache_arrays(cache)
 
-        self.assertTrue(LRUPromptCache._rewind_rotating_cache(cache, 0))
+        self.assertTrue(cache.can_rewind(0))
+        self.assertTrue(cache.rewind(0))
         self.assertEqual(cache.offset, original_offset)
         self.assertEqual(cache._idx, original_idx)
         self.assertTrue(mx.array_equal(cache.keys, original_keys))
@@ -973,7 +971,8 @@ class TestLRUPromptCache(unittest.TestCase):
         cache._idx = cache.keys.shape[2]
         self.assertGreater(cache._idx, cache.offset)
 
-        self.assertTrue(LRUPromptCache._rewind_rotating_cache(cache, 1))
+        self.assertTrue(cache.can_rewind(1))
+        self.assertTrue(cache.rewind(1))
         self.assertEqual(cache.offset, 5)
         self.assertEqual(cache.keys.shape[2], 5)
         self.assertEqual(cache._idx, cache.keys.shape[2])
@@ -1005,9 +1004,6 @@ class TestLRUPromptCache(unittest.TestCase):
             @property
             def nbytes(self):
                 return 1
-
-            def is_trimmable(self):
-                return False
 
         lru = LRUPromptCache(max_size=10)
         model = ("unknown-layer", None, None)
@@ -1043,9 +1039,6 @@ class TestLRUPromptCache(unittest.TestCase):
             def nbytes(self):
                 return 1
 
-            def is_trimmable(self):
-                return False
-
             def __deepcopy__(self, memo):
                 raise AssertionError(
                     "deepcopy should be skipped for unknown non-trimmable layers"
@@ -1065,7 +1058,7 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertIsNotNone(exact_cache)
         self.assertEqual(exact_remaining, [])
 
-    def test_unknown_layer_without_is_trimmable_fails_closed_without_deepcopy(self):
+    def test_unknown_layer_without_can_rewind_fails_closed_without_deepcopy(self):
         class UnknownLayerNoIsTrimmable:
             @property
             def nbytes(self):
@@ -1073,7 +1066,7 @@ class TestLRUPromptCache(unittest.TestCase):
 
             def __deepcopy__(self, memo):
                 raise AssertionError(
-                    "deepcopy should be skipped when layer lacks is_trimmable"
+                    "deepcopy should be skipped when layer lacks can_rewind"
                 )
 
         lru = LRUPromptCache(max_size=10)
@@ -1092,8 +1085,8 @@ class TestLRUPromptCache(unittest.TestCase):
 
     def test_composite_partial_trim_safe_miss_keeps_exact_entry_available(self):
         class PartialTrimLeaf:
-            total_calls = 0
-            trim_args = []
+            total_rewind_calls = 0
+            rewind_args = []
 
             def __init__(self):
                 self.offset = 4
@@ -1102,18 +1095,16 @@ class TestLRUPromptCache(unittest.TestCase):
             def nbytes(self):
                 return 1
 
-            def is_trimmable(self):
-                return True
+            def can_rewind(self, n):
+                return n <= self.offset
 
-            def trim(self, n):
-                type(self).total_calls += 1
-                type(self).trim_args.append(n)
-                trimmed = max(0, n - 1)
-                self.offset = max(0, self.offset - trimmed)
-                return trimmed
+            def rewind(self, n):
+                type(self).total_rewind_calls += 1
+                type(self).rewind_args.append(n)
+                return False
 
         class FullTrimLeaf:
-            total_calls = 0
+            total_rewind_calls = 0
 
             def __init__(self):
                 self.offset = 4
@@ -1122,17 +1113,17 @@ class TestLRUPromptCache(unittest.TestCase):
             def nbytes(self):
                 return 1
 
-            def is_trimmable(self):
+            def can_rewind(self, n):
+                return n <= self.offset
+
+            def rewind(self, n):
+                type(self).total_rewind_calls += 1
+                self.offset = max(0, self.offset - n)
                 return True
 
-            def trim(self, n):
-                type(self).total_calls += 1
-                self.offset = max(0, self.offset - n)
-                return n
-
-        PartialTrimLeaf.total_calls = 0
-        PartialTrimLeaf.trim_args = []
-        FullTrimLeaf.total_calls = 0
+        PartialTrimLeaf.total_rewind_calls = 0
+        PartialTrimLeaf.rewind_args = []
+        FullTrimLeaf.total_rewind_calls = 0
 
         lru = LRUPromptCache(max_size=10)
         model = ("composite-partial", None, None)
@@ -1148,9 +1139,9 @@ class TestLRUPromptCache(unittest.TestCase):
         reused_cache, remaining = lru.fetch_nearest_cache(model, shorter_tokens)
         self.assertIsNone(reused_cache)
         self.assertEqual(remaining, shorter_tokens)
-        self.assertEqual(FullTrimLeaf.total_calls, 1)
-        self.assertEqual(PartialTrimLeaf.total_calls, 1)
-        self.assertEqual(PartialTrimLeaf.trim_args, [expected_num_to_trim])
+        self.assertEqual(FullTrimLeaf.total_rewind_calls, 1)
+        self.assertEqual(PartialTrimLeaf.total_rewind_calls, 1)
+        self.assertEqual(PartialTrimLeaf.rewind_args, [expected_num_to_trim])
 
         # Safe miss should be non-destructive to the longer exact entry.
         exact_cache, exact_remaining = lru.fetch_nearest_cache(model, long_tokens)
@@ -1324,11 +1315,11 @@ class TestLRUPromptCache(unittest.TestCase):
             def nbytes(self):
                 return 1
 
-            def is_trimmable(self):
+            def can_rewind(self, n):
                 return True
 
-            def trim(self, n):
-                return n
+            def rewind(self, n):
+                return True
 
             def __deepcopy__(self, memo):
                 raise AssertionError("deepcopy should be skipped on known-safe miss")
