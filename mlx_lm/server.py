@@ -36,10 +36,9 @@ from huggingface_hub import scan_cache_dir
 from ._version import __version__
 from .generate import BatchGenerator, generation_stream, stream_generate
 from .models.cache import (
+    CacheList,
     RotatingKVCache,
-    can_trim_prompt_cache,
     make_prompt_cache,
-    trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import load, sharded_load
@@ -295,7 +294,12 @@ class LRUPromptCache:
         """
         if num_to_trim <= 0:
             return True
-        if cache.keys is None or num_to_trim > cache.offset:
+        if (
+            cache.keys is None
+            or cache.values is None
+            or num_to_trim > cache.offset
+            or num_to_trim > cache._idx
+        ):
             return False
 
         # Once decode-time in-place rotation starts, ``offset`` can exceed the
@@ -315,16 +319,34 @@ class LRUPromptCache:
         cache._idx = min(cache._idx, cache.keys.shape[2])
         return True
 
+    def _rewind_layer_cache(self, layer_cache, num_to_trim):
+        """
+        Rewind an individual layer cache by ``num_to_trim`` tokens.
+
+        CacheList children are rewound recursively so partial trims in one child
+        cannot be hidden by a full trim return value from another child.
+        """
+        if isinstance(layer_cache, CacheList):
+            return all(
+                self._rewind_layer_cache(child, num_to_trim)
+                for child in layer_cache.caches
+            )
+
+        # Always use strict rotating rewind checks, even when a rotating cache
+        # reports itself as trimmable.
+        if isinstance(layer_cache, RotatingKVCache):
+            return self._rewind_rotating_cache(layer_cache, num_to_trim)
+
+        if layer_cache.is_trimmable():
+            # Fail closed if the layer cannot rewind by the full amount.
+            return layer_cache.trim(num_to_trim) == num_to_trim
+
+        return False
+
     def _rewind_prompt_cache(self, cache, num_to_trim):
-        for layer_cache in cache:
-            if layer_cache.is_trimmable():
-                layer_cache.trim(num_to_trim)
-            elif isinstance(layer_cache, RotatingKVCache):
-                if not self._rewind_rotating_cache(layer_cache, num_to_trim):
-                    return False
-            else:
-                return False
-        return True
+        return all(
+            self._rewind_layer_cache(layer_cache, num_to_trim) for layer_cache in cache
+        )
 
     def fetch_nearest_cache(self, model, tokens):
         result = self._search(model, tokens)
@@ -341,11 +363,6 @@ class LRUPromptCache:
             cache_entry = self._get(result.model, result.longer)
             prefix = min(len(tokens) - 1, result.common_prefix)
             num_to_trim = len(result.longer) - prefix
-
-            if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
-                trim_prompt_cache(cache, num_to_trim)
-                return cache, tokens[prefix:]
 
             cache = copy.deepcopy(cache_entry.prompt_cache)
             if self._rewind_prompt_cache(cache, num_to_trim):
