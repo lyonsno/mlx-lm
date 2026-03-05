@@ -3,8 +3,11 @@
 import importlib
 import unittest
 from itertools import islice
+from unittest.mock import patch
 
 import mlx.core as mx
+
+from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 generate_lib = importlib.import_module("mlx_lm.generate")
 
@@ -274,6 +277,115 @@ class _SameArgmaxDifferentDistributionModel:
             c.offset += 1
         logits = mx.full((1, 1, self.vocab_size), -1e9, dtype=mx.float32)
         logits[:, -1, :] = self.draft_row
+        return logits
+
+
+class _MinimalHFTokenizer:
+    chat_template = None
+    eos_token_id = 9999
+    bos_token = None
+    clean_up_tokenization_spaces = False
+
+    def get_vocab(self):
+        return {}
+
+    def encode(self, text, add_special_tokens=True):
+        del text, add_special_tokens
+        return [5, 7]
+
+    def decode(self, tokens):
+        return "".join(str(int(t)) for t in tokens)
+
+
+class _PassthroughDetokenizer:
+    def __init__(self, tokenizer):
+        del tokenizer
+        self.last_segment = ""
+
+    def add_token(self, token):
+        self.last_segment = str(int(token))
+
+    def finalize(self):
+        pass
+
+
+class _RoutingMTPModel:
+    def __init__(self):
+        self.layers = [object()]
+        self._main_cache = [_TrimmableCache()]
+        self._mtp_cache = [_TrimmableCache()]
+
+    def make_cache(self):
+        return self._main_cache
+
+    def make_mtp_cache(self):
+        return self._mtp_cache
+
+    def mtp_logits(self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError("Routing tests should mock mtp_generate_step.")
+
+
+class _NonMTPModel:
+    def __init__(self):
+        self.layers = [object()]
+
+
+class _MTPModelWithoutCacheFactory:
+    def __init__(self):
+        self.layers = [object()]
+        self._main_cache = [_TrimmableCache()]
+
+    def make_cache(self):
+        return self._main_cache
+
+    def mtp_logits(self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError(
+            "mtp_logits should not be called when mtp_cache is missing and "
+            "model lacks make_mtp_cache."
+        )
+
+
+class _RunnableMTPModelWithoutCacheFactory:
+    def __init__(self, token: int = 3, vocab_size: int = 16):
+        self.layers = [object()]
+        self._main_cache = [_TrimmableCache()]
+        self.token = token
+        self.vocab_size = vocab_size
+        self.hidden_size = 4
+
+    def make_cache(self):
+        return self._main_cache
+
+    def __call__(self, tokens: mx.array, cache=None):
+        logits, _ = self.forward_with_hidden(tokens, cache)
+        return logits
+
+    def forward_with_hidden(self, tokens: mx.array, cache):
+        for c in cache:
+            c.offset += tokens.shape[1]
+        hidden = mx.zeros(
+            (tokens.shape[0], tokens.shape[1], self.hidden_size), dtype=mx.float32
+        )
+        logits = mx.full(
+            (tokens.shape[0], tokens.shape[1], self.vocab_size),
+            -1e9,
+            dtype=mx.float32,
+        )
+        logits[:, -1, self.token] = 0.0
+        return logits, hidden
+
+    def mtp_logits(self, hidden_states: mx.array, draft_tokens: mx.array, cache):
+        del hidden_states
+        for c in cache:
+            c.offset += draft_tokens.shape[1]
+        logits = mx.full(
+            (draft_tokens.shape[0], draft_tokens.shape[1], self.vocab_size),
+            -1e9,
+            dtype=mx.float32,
+        )
+        logits[:, -1, self.token] = 0.0
         return logits
 
 
@@ -668,6 +780,1067 @@ class TestMTPGenerateStep(unittest.TestCase):
             bool(mx.allclose(logprobs, unexpected, rtol=1e-5, atol=1e-6).item()),
             "Accepted tokens should not report draft-head logprobs.",
         )
+
+    def test_stream_generate_use_mtp_routes_to_mtp_generate_step(self):
+        model = _RoutingMTPModel()
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+        prompt = mx.array([5, 7], dtype=mx.uint32)
+
+        verifier_logits = mx.array(
+            [-2.0, -1.4, -0.2, -3.0, -2.1, -4.0], dtype=mx.float32
+        )
+        logprobs = verifier_logits - mx.logsumexp(
+            verifier_logits, axis=-1, keepdims=True
+        )
+        mtp_out = iter([(2, logprobs, True)])
+        vanilla_out = iter([(1, logprobs)])
+
+        with (
+            patch.object(
+                generate_lib, "mtp_generate_step", autospec=True, return_value=mtp_out
+            ) as mtp,
+            patch.object(
+                generate_lib, "generate_step", return_value=vanilla_out
+            ) as vanilla,
+            patch.object(generate_lib, "speculative_generate_step") as speculative,
+        ):
+            results = list(
+                generate_lib.stream_generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=prompt,
+                    max_tokens=1,
+                    use_mtp=True,
+                )
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].token, 2)
+        self.assertTrue(results[0].from_draft)
+        mtp.assert_called_once()
+        self.assertNotIn(
+            "use_mtp",
+            mtp.call_args.kwargs,
+            "use_mtp is a stream_generate control flag and must not be forwarded.",
+        )
+        vanilla.assert_not_called()
+        speculative.assert_not_called()
+
+    def test_stream_generate_rejects_use_mtp_with_draft_model(self):
+        model = _RoutingMTPModel()
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+        prompt = mx.array([5, 7], dtype=mx.uint32)
+
+        with (
+            patch.object(
+                generate_lib,
+                "generate_step",
+                side_effect=AssertionError(
+                    "generate_step should not be entered on conflicting flags."
+                ),
+            ) as vanilla,
+            patch.object(
+                generate_lib,
+                "speculative_generate_step",
+                side_effect=AssertionError(
+                    "speculative_generate_step should not be entered on conflicting flags."
+                ),
+            ) as speculative,
+            patch.object(
+                generate_lib,
+                "mtp_generate_step",
+                side_effect=AssertionError(
+                    "mtp_generate_step should not be entered on conflicting flags."
+                ),
+            ) as mtp,
+        ):
+            with self.assertRaisesRegex(ValueError, "use_mtp"):
+                list(
+                    generate_lib.stream_generate(
+                        model=model,
+                        tokenizer=tokenizer,
+                        prompt=prompt,
+                        max_tokens=1,
+                        use_mtp=True,
+                        draft_model=object(),
+                    )
+                )
+
+        vanilla.assert_not_called()
+        speculative.assert_not_called()
+        mtp.assert_not_called()
+
+    def test_stream_generate_rejects_non_positive_max_tokens_on_vanilla_route(self):
+        model = _RoutingMTPModel()
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+        prompt = mx.array([5, 7], dtype=mx.uint32)
+
+        with (
+            patch.object(
+                generate_lib,
+                "generate_step",
+                side_effect=AssertionError(
+                    "generate_step should not be entered when max_tokens <= 0."
+                ),
+            ) as vanilla,
+            patch.object(
+                generate_lib,
+                "speculative_generate_step",
+                side_effect=AssertionError(
+                    "speculative_generate_step should not be entered when "
+                    "max_tokens <= 0."
+                ),
+            ) as speculative,
+            patch.object(
+                generate_lib,
+                "mtp_generate_step",
+                side_effect=AssertionError(
+                    "mtp_generate_step should not be entered when max_tokens <= 0."
+                ),
+            ) as mtp,
+        ):
+            for bad_max_tokens in (0, -1):
+                with self.subTest(max_tokens=bad_max_tokens):
+                    with self.assertRaisesRegex(ValueError, "max_tokens"):
+                        list(
+                            generate_lib.stream_generate(
+                                model=model,
+                                tokenizer=tokenizer,
+                                prompt=prompt,
+                                max_tokens=bad_max_tokens,
+                            )
+                        )
+
+    def test_stream_generate_use_mtp_rejects_non_positive_max_tokens(self):
+        model = _RoutingMTPModel()
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+        prompt = mx.array([5, 7], dtype=mx.uint32)
+
+        with (
+            patch.object(
+                generate_lib,
+                "generate_step",
+                side_effect=AssertionError(
+                    "generate_step should not be entered when max_tokens <= 0."
+                ),
+            ) as vanilla,
+            patch.object(
+                generate_lib,
+                "speculative_generate_step",
+                side_effect=AssertionError(
+                    "speculative_generate_step should not be entered when "
+                    "max_tokens <= 0."
+                ),
+            ) as speculative,
+            patch.object(
+                generate_lib,
+                "mtp_generate_step",
+                side_effect=AssertionError(
+                    "mtp_generate_step should not be entered when max_tokens <= 0."
+                ),
+            ) as mtp,
+        ):
+            for bad_max_tokens in (0, -1):
+                with self.subTest(max_tokens=bad_max_tokens):
+                    with self.assertRaisesRegex(ValueError, "max_tokens"):
+                        list(
+                            generate_lib.stream_generate(
+                                model=model,
+                                tokenizer=tokenizer,
+                                prompt=prompt,
+                                max_tokens=bad_max_tokens,
+                                use_mtp=True,
+                            )
+                        )
+
+    def test_stream_generate_speculative_route_rejects_non_positive_max_tokens(self):
+        model = _RoutingMTPModel()
+        draft_model = object()
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+        prompt = mx.array([5, 7], dtype=mx.uint32)
+
+        with (
+            patch.object(
+                generate_lib,
+                "generate_step",
+                side_effect=AssertionError(
+                    "generate_step should not be entered when max_tokens <= 0."
+                ),
+            ) as vanilla,
+            patch.object(
+                generate_lib,
+                "speculative_generate_step",
+                side_effect=AssertionError(
+                    "speculative_generate_step should not be entered when "
+                    "max_tokens <= 0."
+                ),
+            ) as speculative,
+            patch.object(
+                generate_lib,
+                "mtp_generate_step",
+                side_effect=AssertionError(
+                    "mtp_generate_step should not be entered when max_tokens <= 0."
+                ),
+            ) as mtp,
+        ):
+            for bad_max_tokens in (0, -1):
+                with self.subTest(max_tokens=bad_max_tokens):
+                    with self.assertRaisesRegex(ValueError, "max_tokens"):
+                        list(
+                            generate_lib.stream_generate(
+                                model=model,
+                                tokenizer=tokenizer,
+                                prompt=prompt,
+                                max_tokens=bad_max_tokens,
+                                draft_model=draft_model,
+                            )
+                        )
+
+    def test_stream_generate_rejects_boolean_max_tokens(self):
+        model = _RoutingMTPModel()
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+        prompt = mx.array([5, 7], dtype=mx.uint32)
+
+        with (
+            patch.object(
+                generate_lib,
+                "generate_step",
+                side_effect=AssertionError(
+                    "generate_step should not be entered when max_tokens is boolean."
+                ),
+            ) as vanilla,
+            patch.object(
+                generate_lib,
+                "speculative_generate_step",
+                side_effect=AssertionError(
+                    "speculative_generate_step should not be entered when max_tokens is "
+                    "boolean."
+                ),
+            ) as speculative,
+            patch.object(
+                generate_lib,
+                "mtp_generate_step",
+                side_effect=AssertionError(
+                    "mtp_generate_step should not be entered when max_tokens is boolean."
+                ),
+            ) as mtp,
+        ):
+            for bad_max_tokens in (True, False):
+                with self.subTest(max_tokens=bad_max_tokens):
+                    with self.assertRaisesRegex(ValueError, "max_tokens"):
+                        list(
+                            generate_lib.stream_generate(
+                                model=model,
+                                tokenizer=tokenizer,
+                                prompt=prompt,
+                                max_tokens=bad_max_tokens,
+                            )
+                        )
+
+    def test_stream_generate_rejects_non_bool_use_mtp(self):
+        model = _RoutingMTPModel()
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+        prompt = mx.array([5, 7], dtype=mx.uint32)
+
+        with (
+            patch.object(
+                generate_lib,
+                "generate_step",
+                side_effect=AssertionError(
+                    "generate_step should not be entered when use_mtp is invalid."
+                ),
+            ) as vanilla,
+            patch.object(
+                generate_lib,
+                "speculative_generate_step",
+                side_effect=AssertionError(
+                    "speculative_generate_step should not be entered when use_mtp is "
+                    "invalid."
+                ),
+            ) as speculative,
+            patch.object(
+                generate_lib,
+                "mtp_generate_step",
+                side_effect=AssertionError(
+                    "mtp_generate_step should not be entered when use_mtp is invalid."
+                ),
+            ) as mtp,
+        ):
+            for bad_use_mtp in ("true", 1, None):
+                with self.subTest(use_mtp=bad_use_mtp):
+                    with self.assertRaisesRegex(
+                        ValueError, "use_mtp must be a boolean"
+                    ):
+                        list(
+                            generate_lib.stream_generate(
+                                model=model,
+                                tokenizer=tokenizer,
+                                prompt=prompt,
+                                max_tokens=1,
+                                use_mtp=bad_use_mtp,
+                            )
+                        )
+
+    def test_stream_generate_default_route_stays_vanilla_for_mtp_capable_model(self):
+        model = _RoutingMTPModel()
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+        prompt = mx.array([5, 7], dtype=mx.uint32)
+
+        verifier_logits = mx.array(
+            [-2.0, -1.4, -0.2, -3.0, -2.1, -4.0], dtype=mx.float32
+        )
+        logprobs = verifier_logits - mx.logsumexp(
+            verifier_logits, axis=-1, keepdims=True
+        )
+        vanilla_out = iter([(1, logprobs)])
+
+        with (
+            patch.object(
+                generate_lib, "generate_step", autospec=True, return_value=vanilla_out
+            ) as vanilla,
+            patch.object(generate_lib, "mtp_generate_step") as mtp,
+            patch.object(generate_lib, "speculative_generate_step") as speculative,
+        ):
+            results = list(
+                generate_lib.stream_generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=prompt,
+                    max_tokens=1,
+                )
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].token, 1)
+        self.assertFalse(results[0].from_draft)
+        vanilla.assert_called_once()
+        mtp.assert_not_called()
+        speculative.assert_not_called()
+
+    def test_stream_generate_use_mtp_false_routes_to_vanilla(self):
+        model = _RoutingMTPModel()
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+        prompt = mx.array([5, 7], dtype=mx.uint32)
+        mtp_cache = [_TrimmableCache()]
+
+        verifier_logits = mx.array(
+            [-2.0, -1.4, -0.2, -3.0, -2.1, -4.0], dtype=mx.float32
+        )
+        logprobs = verifier_logits - mx.logsumexp(
+            verifier_logits, axis=-1, keepdims=True
+        )
+        vanilla_out = iter([(1, logprobs)])
+
+        with (
+            patch.object(
+                generate_lib, "generate_step", autospec=True, return_value=vanilla_out
+            ) as vanilla,
+            patch.object(generate_lib, "mtp_generate_step") as mtp,
+            patch.object(generate_lib, "speculative_generate_step") as speculative,
+        ):
+            results = list(
+                generate_lib.stream_generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=prompt,
+                    max_tokens=1,
+                    use_mtp=False,
+                    num_draft_tokens=3,
+                    mtp_cache=mtp_cache,
+                )
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].token, 1)
+        self.assertFalse(results[0].from_draft)
+        vanilla.assert_called_once()
+        self.assertNotIn(
+            "use_mtp",
+            vanilla.call_args.kwargs,
+            "use_mtp=False should not be forwarded to generate_step.",
+        )
+        self.assertNotIn(
+            "num_draft_tokens",
+            vanilla.call_args.kwargs,
+            "num_draft_tokens should be stripped when draft_model is not provided.",
+        )
+        self.assertNotIn(
+            "mtp_cache",
+            vanilla.call_args.kwargs,
+            "mtp_cache should not be forwarded on the vanilla route.",
+        )
+        mtp.assert_not_called()
+        speculative.assert_not_called()
+
+    def test_stream_generate_use_mtp_filters_invalid_kwargs_before_mtp_call(self):
+        model = _RoutingMTPModel()
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+        prompt = mx.array([5, 7], dtype=mx.uint32)
+        sampler = lambda x: mx.argmax(x, axis=-1)
+        prompt_cache = [_TrimmableCache()]
+        mtp_cache = [_TrimmableCache()]
+        input_embeddings = mx.zeros((2, 4), dtype=mx.float32)
+        kv_bits = 4
+        kv_group_size = 32
+        quantized_kv_start = 11
+
+        def logits_processor(tokens, logits):
+            del tokens
+            return logits
+
+        verifier_logits = mx.array(
+            [-2.0, -1.4, -0.2, -3.0, -2.1, -4.0], dtype=mx.float32
+        )
+        logprobs = verifier_logits - mx.logsumexp(
+            verifier_logits, axis=-1, keepdims=True
+        )
+        mtp_out = iter([(2, logprobs, True)])
+        vanilla_out = iter([(1, logprobs)])
+
+        def progress_callback(processed: int, total: int):
+            del processed, total
+
+        with (
+            patch.object(
+                generate_lib, "mtp_generate_step", autospec=True, return_value=mtp_out
+            ) as mtp,
+            patch.object(
+                generate_lib, "generate_step", return_value=vanilla_out
+            ) as vanilla,
+            patch.object(generate_lib, "speculative_generate_step") as speculative,
+        ):
+            results = list(
+                generate_lib.stream_generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=prompt,
+                    max_tokens=1,
+                    use_mtp=True,
+                    num_draft_tokens=3,
+                    max_kv_size=128,
+                    prompt_progress_callback=progress_callback,
+                    prefill_step_size=17,
+                    sampler=sampler,
+                    prompt_cache=prompt_cache,
+                    mtp_cache=mtp_cache,
+                    kv_bits=kv_bits,
+                    kv_group_size=kv_group_size,
+                    quantized_kv_start=quantized_kv_start,
+                    input_embeddings=input_embeddings,
+                    logits_processors=[logits_processor],
+                )
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].token, 2)
+        self.assertTrue(results[0].from_draft)
+        mtp.assert_called_once()
+        self.assertNotIn("use_mtp", mtp.call_args.kwargs)
+        self.assertNotIn("num_draft_tokens", mtp.call_args.kwargs)
+        self.assertNotIn("max_kv_size", mtp.call_args.kwargs)
+        self.assertNotIn("prompt_progress_callback", mtp.call_args.kwargs)
+        self.assertNotIn("input_embeddings", mtp.call_args.kwargs)
+        self.assertNotIn("logits_processors", mtp.call_args.kwargs)
+        self.assertEqual(
+            mtp.call_args.kwargs.get("max_tokens"),
+            1,
+            "max_tokens should be forwarded to mtp_generate_step.",
+        )
+        self.assertEqual(
+            mtp.call_args.kwargs.get("prefill_step_size"),
+            17,
+            "Valid MTP kwargs should be preserved when routing.",
+        )
+        self.assertIs(
+            mtp.call_args.kwargs.get("sampler"),
+            sampler,
+            "Sampler should be forwarded unchanged to mtp_generate_step.",
+        )
+        self.assertIs(
+            mtp.call_args.kwargs.get("prompt_cache"),
+            prompt_cache,
+            "prompt_cache should be forwarded unchanged to mtp_generate_step.",
+        )
+        self.assertIs(
+            mtp.call_args.kwargs.get("mtp_cache"),
+            mtp_cache,
+            "mtp_cache should be forwarded unchanged to mtp_generate_step.",
+        )
+        self.assertEqual(
+            mtp.call_args.kwargs.get("kv_bits"),
+            kv_bits,
+            "kv_bits should be preserved on the MTP route.",
+        )
+        self.assertEqual(
+            mtp.call_args.kwargs.get("kv_group_size"),
+            kv_group_size,
+            "kv_group_size should be preserved on the MTP route.",
+        )
+        self.assertEqual(
+            mtp.call_args.kwargs.get("quantized_kv_start"),
+            quantized_kv_start,
+            "quantized_kv_start should be preserved on the MTP route.",
+        )
+        vanilla.assert_not_called()
+        speculative.assert_not_called()
+
+    def test_stream_generate_draft_model_with_use_mtp_false_routes_speculative(self):
+        model = _RoutingMTPModel()
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+        prompt = mx.array([5, 7], dtype=mx.uint32)
+        draft_model = object()
+        num_draft_tokens = 5
+        input_embeddings = mx.zeros((2, 4), dtype=mx.float32)
+        mtp_cache = [_TrimmableCache()]
+
+        def progress_callback(processed: int, total: int):
+            del processed, total
+
+        verifier_logits = mx.array(
+            [-2.0, -1.4, -0.2, -3.0, -2.1, -4.0], dtype=mx.float32
+        )
+        logprobs = verifier_logits - mx.logsumexp(
+            verifier_logits, axis=-1, keepdims=True
+        )
+        speculative_out = iter([(3, logprobs, True)])
+
+        with (
+            patch.object(generate_lib, "generate_step") as vanilla,
+            patch.object(generate_lib, "mtp_generate_step") as mtp,
+            patch.object(
+                generate_lib,
+                "speculative_generate_step",
+                autospec=True,
+                return_value=speculative_out,
+            ) as speculative,
+        ):
+            results = list(
+                generate_lib.stream_generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=prompt,
+                    max_tokens=1,
+                    draft_model=draft_model,
+                    num_draft_tokens=num_draft_tokens,
+                    use_mtp=False,
+                    max_kv_size=64,
+                    prompt_progress_callback=progress_callback,
+                    input_embeddings=input_embeddings,
+                    mtp_cache=mtp_cache,
+                )
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].token, 3)
+        self.assertTrue(results[0].from_draft)
+        speculative.assert_called_once()
+        called_draft_model = (
+            speculative.call_args.args[2]
+            if len(speculative.call_args.args) > 2
+            else speculative.call_args.kwargs.get("draft_model")
+        )
+        self.assertIs(
+            called_draft_model,
+            draft_model,
+            "draft_model should be forwarded unchanged to speculative_generate_step.",
+        )
+        self.assertEqual(
+            speculative.call_args.kwargs.get("num_draft_tokens"),
+            num_draft_tokens,
+            "num_draft_tokens should be preserved on the speculative route.",
+        )
+        self.assertEqual(
+            speculative.call_args.kwargs.get("max_tokens"),
+            1,
+            "max_tokens should be forwarded to speculative_generate_step.",
+        )
+        self.assertNotIn(
+            "use_mtp",
+            speculative.call_args.kwargs,
+            "use_mtp flag should not be forwarded to speculative_generate_step.",
+        )
+        self.assertNotIn(
+            "max_kv_size",
+            speculative.call_args.kwargs,
+            "max_kv_size should be stripped on speculative route.",
+        )
+        self.assertNotIn(
+            "prompt_progress_callback",
+            speculative.call_args.kwargs,
+            "prompt_progress_callback should be stripped on speculative route.",
+        )
+        self.assertNotIn(
+            "input_embeddings",
+            speculative.call_args.kwargs,
+            "input_embeddings should not be forwarded to speculative_generate_step.",
+        )
+        self.assertNotIn(
+            "mtp_cache",
+            speculative.call_args.kwargs,
+            "mtp_cache should not be forwarded on the speculative route.",
+        )
+        vanilla.assert_not_called()
+        mtp.assert_not_called()
+
+    def test_stream_generate_use_mtp_routes_with_list_prompt(self):
+        model = _RoutingMTPModel()
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+        prompt = [5, 7]
+
+        verifier_logits = mx.array(
+            [-2.0, -1.4, -0.2, -3.0, -2.1, -4.0], dtype=mx.float32
+        )
+        logprobs = verifier_logits - mx.logsumexp(
+            verifier_logits, axis=-1, keepdims=True
+        )
+        mtp_out = iter([(2, logprobs, True)])
+        vanilla_out = iter([(1, logprobs)])
+
+        with (
+            patch.object(
+                generate_lib, "mtp_generate_step", autospec=True, return_value=mtp_out
+            ) as mtp,
+            patch.object(
+                generate_lib, "generate_step", return_value=vanilla_out
+            ) as vanilla,
+            patch.object(generate_lib, "speculative_generate_step") as speculative,
+        ):
+            results = list(
+                generate_lib.stream_generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=prompt,
+                    max_tokens=1,
+                    use_mtp=True,
+                )
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].token, 2)
+        self.assertTrue(results[0].from_draft)
+        mtp.assert_called_once()
+        prompt_arg = mtp.call_args.args[0]
+        self.assertIsInstance(
+            prompt_arg,
+            type(mx.array([0], dtype=mx.uint32)),
+            "List prompts should be normalized to mx.array before MTP routing.",
+        )
+        self.assertEqual(
+            [int(t) for t in prompt_arg.tolist()],
+            [5, 7],
+            "List prompt token values should be preserved through normalization.",
+        )
+        vanilla.assert_not_called()
+        speculative.assert_not_called()
+
+    def test_stream_generate_use_mtp_routes_with_string_prompt(self):
+        model = _RoutingMTPModel()
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+        prompt = "hello"
+
+        verifier_logits = mx.array(
+            [-2.0, -1.4, -0.2, -3.0, -2.1, -4.0], dtype=mx.float32
+        )
+        logprobs = verifier_logits - mx.logsumexp(
+            verifier_logits, axis=-1, keepdims=True
+        )
+        mtp_out = iter([(2, logprobs, True)])
+        vanilla_out = iter([(1, logprobs)])
+
+        with (
+            patch.object(
+                generate_lib, "mtp_generate_step", autospec=True, return_value=mtp_out
+            ) as mtp,
+            patch.object(
+                generate_lib, "generate_step", return_value=vanilla_out
+            ) as vanilla,
+            patch.object(generate_lib, "speculative_generate_step") as speculative,
+        ):
+            results = list(
+                generate_lib.stream_generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=prompt,
+                    max_tokens=1,
+                    use_mtp=True,
+                )
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].token, 2)
+        self.assertTrue(results[0].from_draft)
+        mtp.assert_called_once()
+        prompt_arg = mtp.call_args.args[0]
+        self.assertIsInstance(
+            prompt_arg,
+            type(mx.array([0], dtype=mx.uint32)),
+            "String prompts should be tokenized and normalized to mx.array for MTP routing.",
+        )
+        self.assertEqual(
+            [int(t) for t in prompt_arg.tolist()],
+            [5, 7],
+            "Tokenized string prompt should be forwarded to MTP routing.",
+        )
+        vanilla.assert_not_called()
+        speculative.assert_not_called()
+
+    def test_stream_generate_use_mtp_wraps_plain_tokenizer(self):
+        model = _RoutingMTPModel()
+        tokenizer = _MinimalHFTokenizer()
+        prompt = "hello"
+
+        verifier_logits = mx.array(
+            [-2.0, -1.4, -0.2, -3.0, -2.1, -4.0], dtype=mx.float32
+        )
+        logprobs = verifier_logits - mx.logsumexp(
+            verifier_logits, axis=-1, keepdims=True
+        )
+        mtp_out = iter([(2, logprobs, True)])
+        vanilla_out = iter([(1, logprobs)])
+
+        with (
+            patch.object(
+                generate_lib, "mtp_generate_step", autospec=True, return_value=mtp_out
+            ) as mtp,
+            patch.object(
+                generate_lib, "generate_step", return_value=vanilla_out
+            ) as vanilla,
+            patch.object(generate_lib, "speculative_generate_step") as speculative,
+        ):
+            results = list(
+                generate_lib.stream_generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=prompt,
+                    max_tokens=1,
+                    use_mtp=True,
+                )
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].token, 2)
+        self.assertTrue(results[0].from_draft)
+        mtp.assert_called_once()
+        prompt_arg = mtp.call_args.args[0]
+        self.assertIsInstance(
+            prompt_arg,
+            type(mx.array([0], dtype=mx.uint32)),
+            "Plain tokenizer input should be wrapped and normalized to mx.array.",
+        )
+        self.assertEqual(
+            [int(t) for t in prompt_arg.tolist()],
+            [5, 7],
+            "Auto-wrapped tokenizer should preserve encoded prompt token ids.",
+        )
+        vanilla.assert_not_called()
+        speculative.assert_not_called()
+
+    def test_stream_generate_use_mtp_plain_tokenizer_smoke_stops_on_eos(self):
+        model = _FakeMTPModel(
+            draft_tokens=[4],
+            verify_tokens=[4],
+        )
+        tokenizer = _MinimalHFTokenizer()
+        tokenizer.eos_token_id = 4
+
+        results = list(
+            generate_lib.stream_generate(
+                model=model,
+                tokenizer=tokenizer,
+                prompt="hello",
+                max_tokens=3,
+                use_mtp=True,
+                prompt_cache=model.make_cache(),
+                mtp_cache=model.make_mtp_cache(),
+            )
+        )
+
+        # EOS on first token should produce only the terminal response, even
+        # when stream_generate wraps a plain tokenizer internally.
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].token, 4)
+        self.assertTrue(results[0].from_draft)
+        self.assertEqual(results[0].finish_reason, "stop")
+
+    def test_stream_generate_use_mtp_smoke_uses_real_mtp_generator(self):
+        model = _FakeMTPModel(
+            draft_tokens=[7, 8],
+            verify_tokens=[7, 4],
+        )
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+
+        results = list(
+            generate_lib.stream_generate(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=[1],
+                max_tokens=2,
+                use_mtp=True,
+                prompt_cache=model.make_cache(),
+                mtp_cache=model.make_mtp_cache(),
+            )
+        )
+
+        # stream_generate yields interim chunks plus a final response.
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0].token, 7)
+        self.assertTrue(results[0].from_draft)
+        self.assertIsNone(results[0].finish_reason)
+
+        self.assertEqual(results[1].token, 4)
+        self.assertFalse(results[1].from_draft)
+        self.assertEqual(results[1].finish_reason, "length")
+
+    def test_stream_generate_use_mtp_smoke_uses_default_caches(self):
+        model = _FakeMTPModel(
+            draft_tokens=[7, 8],
+            verify_tokens=[7, 4],
+        )
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+
+        results = list(
+            generate_lib.stream_generate(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=[1],
+                max_tokens=2,
+                use_mtp=True,
+            )
+        )
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0].token, 7)
+        self.assertTrue(results[0].from_draft)
+        self.assertIsNone(results[0].finish_reason)
+
+        self.assertEqual(results[1].token, 4)
+        self.assertFalse(results[1].from_draft)
+        self.assertEqual(results[1].finish_reason, "length")
+        self.assertGreater(
+            model._main_cache[0].offset,
+            0,
+            "Default prompt cache creation should advance model main cache state.",
+        )
+        self.assertGreater(
+            model._mtp_cache[0].offset,
+            0,
+            "Default MTP cache creation should advance model MTP cache state.",
+        )
+
+    def test_stream_generate_use_mtp_smoke_stops_on_eos(self):
+        model = _FakeMTPModel(
+            draft_tokens=[4],
+            verify_tokens=[4],
+        )
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[4],
+        )
+
+        results = list(
+            generate_lib.stream_generate(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=[1],
+                max_tokens=3,
+                use_mtp=True,
+                prompt_cache=model.make_cache(),
+                mtp_cache=model.make_mtp_cache(),
+            )
+        )
+
+        # EOS on first token should produce only the terminal response.
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].token, 4)
+        self.assertTrue(results[0].from_draft)
+        self.assertEqual(results[0].finish_reason, "stop")
+
+    def test_mtp_generate_requires_make_mtp_cache_or_explicit_mtp_cache(self):
+        model = _MTPModelWithoutCacheFactory()
+        mtp_generate_step = getattr(generate_lib, "mtp_generate_step", None)
+        self.assertTrue(
+            callable(mtp_generate_step),
+            "Expected callable mlx_lm.generate.mtp_generate_step for behavior tests.",
+        )
+
+        prompt = mx.array([1], dtype=mx.uint32)
+        with self.assertRaisesRegex(ValueError, "mtp_cache is required"):
+            list(
+                islice(
+                    mtp_generate_step(
+                        prompt,
+                        model,
+                        max_tokens=1,
+                    ),
+                    1,
+                )
+            )
+
+    def test_mtp_generate_accepts_explicit_mtp_cache_without_make_mtp_cache(self):
+        model = _RunnableMTPModelWithoutCacheFactory(token=3)
+        explicit_mtp_cache = [_TrimmableCache()]
+        mtp_generate_step = getattr(generate_lib, "mtp_generate_step", None)
+        self.assertTrue(
+            callable(mtp_generate_step),
+            "Expected callable mlx_lm.generate.mtp_generate_step for behavior tests.",
+        )
+
+        prompt = mx.array([1], dtype=mx.uint32)
+        results = list(
+            islice(
+                mtp_generate_step(
+                    prompt,
+                    model,
+                    max_tokens=1,
+                    prompt_cache=model.make_cache(),
+                    mtp_cache=explicit_mtp_cache,
+                ),
+                1,
+            )
+        )
+        self.assertEqual(len(results), 1)
+        token, _, from_draft = results[0]
+        self.assertEqual(token, 3)
+        self.assertTrue(from_draft)
+        self.assertGreater(
+            explicit_mtp_cache[0].offset,
+            0,
+            "Explicit mtp_cache should be accepted and advanced.",
+        )
+
+    def test_stream_generate_use_mtp_accepts_explicit_mtp_cache_without_factory(self):
+        model = _RunnableMTPModelWithoutCacheFactory(token=3)
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+        explicit_mtp_cache = [_TrimmableCache()]
+
+        results = list(
+            generate_lib.stream_generate(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=[1],
+                max_tokens=1,
+                use_mtp=True,
+                prompt_cache=model.make_cache(),
+                mtp_cache=explicit_mtp_cache,
+            )
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].token, 3)
+        self.assertTrue(results[0].from_draft)
+        self.assertEqual(results[0].finish_reason, "length")
+        self.assertGreater(
+            explicit_mtp_cache[0].offset,
+            0,
+            "stream_generate should forward explicit mtp_cache to MTP generation.",
+        )
+
+    def test_stream_generate_use_mtp_on_non_mtp_model_raises_clear_error(self):
+        model = _NonMTPModel()
+        tokenizer = TokenizerWrapper(
+            _MinimalHFTokenizer(),
+            detokenizer_class=_PassthroughDetokenizer,
+            eos_token_ids=[9999],
+        )
+        prompt = mx.array([5, 7], dtype=mx.uint32)
+
+        with (
+            patch.object(
+                generate_lib,
+                "generate_step",
+                side_effect=AssertionError(
+                    "generate_step should not be entered when use_mtp=True."
+                ),
+            ) as vanilla,
+            patch.object(
+                generate_lib,
+                "speculative_generate_step",
+                side_effect=AssertionError(
+                    "speculative_generate_step should not be entered when use_mtp=True."
+                ),
+            ) as speculative,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                r"(?i)(does not (expose|support).*(mtp|mtp_logits)|required for mtp)",
+            ):
+                list(
+                    generate_lib.stream_generate(
+                        model=model,
+                        tokenizer=tokenizer,
+                        prompt=prompt,
+                        max_tokens=1,
+                        use_mtp=True,
+                    )
+                )
+
+        vanilla.assert_not_called()
+        speculative.assert_not_called()
 
 
 if __name__ == "__main__":

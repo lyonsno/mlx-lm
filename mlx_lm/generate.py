@@ -825,18 +825,36 @@ def stream_generate(
         tokenizer (PreTrainedTokenizer): The tokenizer.
         prompt (Union[str, mx.array, List[int]]): The input prompt string or
           integer tokens.
-        max_tokens (int): The maximum number of tokens to generate.
+        max_tokens (int): The maximum number of tokens to generate. Must be
+          a positive integer.
           Default: ``256``.
         draft_model (Optional[nn.Module]): An optional draft model. If provided
           then speculative decoding is used. The draft model must use the same
           tokenizer as the main model. Default: ``None``.
-        kwargs: The remaining options get passed to :func:`generate_step`.
-          See :func:`generate_step` for more details.
+        kwargs: Additional generation options and route controls. ``use_mtp``
+          is consumed by this function and not forwarded downstream.
 
     Yields:
         GenerationResponse: An instance containing the generated text segment and
             associated metadata. See :class:`GenerationResponse` for details.
     """
+    use_mtp = kwargs.pop("use_mtp", False)
+    if not isinstance(use_mtp, bool):
+        raise ValueError("use_mtp must be a boolean")
+
+    if (
+        isinstance(max_tokens, bool)
+        or not isinstance(max_tokens, int)
+        or max_tokens <= 0
+    ):
+        raise ValueError("max_tokens must be a positive integer")
+
+    if use_mtp and draft_model is not None:
+        raise ValueError(
+            "use_mtp cannot be combined with draft_model. "
+            "Use either use_mtp=True or draft_model, not both."
+        )
+
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
 
@@ -853,8 +871,20 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
+    if use_mtp:
+        if not hasattr(model, "mtp_logits"):
+            raise ValueError(
+                "Model does not expose mtp_logits required for MTP generation."
+            )
         kwargs.pop("num_draft_tokens", None)
+        kwargs.pop("max_kv_size", None)
+        kwargs.pop("prompt_progress_callback", None)
+        kwargs.pop("input_embeddings", None)
+        kwargs.pop("logits_processors", None)
+        token_generator = mtp_generate_step(prompt, model, **kwargs)
+    elif draft_model is None:
+        kwargs.pop("num_draft_tokens", None)
+        kwargs.pop("mtp_cache", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
@@ -863,6 +893,8 @@ def stream_generate(
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
+        kwargs.pop("input_embeddings", None)
+        kwargs.pop("mtp_cache", None)
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )
