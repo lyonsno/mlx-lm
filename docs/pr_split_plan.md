@@ -39,7 +39,7 @@ testable, and easy to merge.
 Note: split 1 and split 2 were intentionally combined in one commit to avoid
 an intermediate state where server and cache APIs diverged.
 
-### Split 3: Regression + Integration Coverage Pass (Planned)
+### Split 3: Regression + Integration Coverage Pass (In Progress)
 
 - Goal: lock down behavior contracts across mixed cache paths.
 - Scope:
@@ -49,6 +49,10 @@ an intermediate state where server and cache APIs diverged.
     - exact-entry preservation and refcount behavior,
     - no-deepcopy miss path guarantees.
   - Trim brittle internals assertions where possible in favor of behavior checks.
+  - Split monolithic prompt-cache tests into:
+    - `tests/test_prompt_cache_server_behavior.py`
+    - `tests/test_prompt_cache_server_rewind_internal.py`
+    - shared helpers in `tests/prompt_cache_test_utils.py`.
 - Expected PR label: `tests/mixed-cache-rewind-contracts`
 - Risk: low.
 - Merge dependency: Split 2.
