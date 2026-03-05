@@ -1083,6 +1083,46 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertIsNotNone(exact_cache)
         self.assertEqual(exact_remaining, [])
 
+    def test_legacy_trimmable_layer_without_rewind_api_still_reuses(self):
+        class LegacyTrimLayer:
+            total_trim_calls = 0
+            trim_args = []
+
+            def __init__(self):
+                self.offset = 4
+
+            @property
+            def nbytes(self):
+                return 1
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                type(self).total_trim_calls += 1
+                type(self).trim_args.append(n)
+                if n > self.offset:
+                    return self.offset
+                self.offset -= n
+                return n
+
+        LegacyTrimLayer.total_trim_calls = 0
+        LegacyTrimLayer.trim_args = []
+
+        lru = LRUPromptCache(max_size=10)
+        model = ("legacy-trim-layer", None, None)
+        long_tokens = [1, 2, 3, 4]
+        shorter_tokens = [1, 2]
+        expected_num_to_trim = len(long_tokens) - (len(shorter_tokens) - 1)
+
+        lru.insert_cache(model, long_tokens, [LegacyTrimLayer()])
+        reused_cache, remaining = lru.fetch_nearest_cache(model, shorter_tokens)
+        self.assertIsNotNone(reused_cache)
+        self.assertEqual(remaining, shorter_tokens[-1:])
+        self.assertEqual(LegacyTrimLayer.total_trim_calls, 1)
+        self.assertEqual(LegacyTrimLayer.trim_args, [expected_num_to_trim])
+        self.assertEqual(reused_cache[0].offset, 1)
+
     def test_composite_partial_trim_safe_miss_keeps_exact_entry_available(self):
         class PartialTrimLeaf:
             total_rewind_calls = 0

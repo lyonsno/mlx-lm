@@ -145,10 +145,25 @@ class _BaseCache:
         return False
 
     def can_rewind(self, num_to_trim: int) -> bool:
-        return False
+        # Compatibility fallback for cache implementations that only define
+        # the legacy is_trimmable()/trim() contract.
+        try:
+            return bool(self.is_trimmable())
+        except Exception:
+            return False
 
     def rewind(self, num_to_trim: int) -> bool:
-        return False
+        if not self.can_rewind(num_to_trim):
+            return False
+        if num_to_trim <= 0:
+            return True
+        trim = getattr(self, "trim", None)
+        if not callable(trim):
+            return False
+        try:
+            return trim(num_to_trim) == num_to_trim
+        except Exception:
+            return False
 
     def size(self):
         """

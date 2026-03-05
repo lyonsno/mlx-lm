@@ -12,27 +12,32 @@ testable, and easy to merge.
 
 ## Current Workstream: Prompt Cache Rewind Hardening
 
-### Split 1: Cache-Owned Rewind API (In Progress)
+### Split 1: Cache-Owned Rewind API (Landed)
 
 - Goal: move rewind invariants into cache classes.
 - Scope:
   - Add public `can_rewind(num_to_trim)` and `rewind(num_to_trim)` API on cache types.
   - Implement strict rotating rewind checks inside `RotatingKVCache`.
   - Add/update unit tests for rewind API behavior.
+- Landed in: `a361270`
 - Expected PR label: `refactor/cache-rewind-api`
 - Risk: medium (touches multiple cache classes).
 - Merge dependency: none.
 
-### Split 2: Server Migration to Public Rewind API (Planned)
+### Split 2: Server Migration to Public Rewind API (Landed)
 
 - Goal: remove server coupling to rotating private internals.
 - Scope:
   - Update `LRUPromptCache` to call `can_rewind`/`rewind` only.
   - Remove rotating-specific branching/private-field access from server.
   - Keep fail-closed semantics and non-destructive safe-miss behavior.
+- Landed in: `a361270`
 - Expected PR label: `refactor/server-rewind-dispatch`
 - Risk: medium (affects reuse hit/miss paths).
 - Merge dependency: Split 1.
+
+Note: split 1 and split 2 were intentionally combined in one commit to avoid
+an intermediate state where server and cache APIs diverged.
 
 ### Split 3: Regression + Integration Coverage Pass (Planned)
 
