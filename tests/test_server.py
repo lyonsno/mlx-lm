@@ -1063,6 +1063,94 @@ class TestLRUPromptCache(unittest.TestCase):
                 [c.offset for c in reused_cache], [c.offset for c in baseline_cache]
             )
 
+    def test_mixed_cache_longer_prefix_reuse_after_chunked_prefill(self):
+        lru = LRUPromptCache(max_size=10)
+        model_key = ("step3p5-tiny-chunked", None, None)
+        model = self._make_tiny_step3p5_model()
+
+        long_tokens = list(range(1, 13))
+        shorter_tokens = long_tokens[:10]
+        continuation_tokens = [42, 43, 44]
+
+        long_array = mx.array([long_tokens], dtype=mx.int32)
+        shorter_array = mx.array([shorter_tokens], dtype=mx.int32)
+        remaining_array = mx.array([shorter_tokens[-1:]], dtype=mx.int32)
+
+        long_cache = model.make_cache()
+        # Simulate chunked prefill to reproduce the real server path where
+        # rotating caches can have offset > backing length before decode.
+        mx.eval(model(long_array[:, :8], cache=long_cache))
+        mx.eval(model(long_array[:, 8:], cache=long_cache))
+
+        rotating_layers = [c for c in long_cache if isinstance(c, RotatingKVCache)]
+        self.assertGreater(len(rotating_layers), 0)
+        for sliding in rotating_layers:
+            self.assertGreater(sliding.offset, sliding.keys.shape[2])
+            self.assertEqual(sliding._idx, sliding.keys.shape[2])
+            self.assertGreater(sliding.keys.shape[2], sliding.max_size)
+
+        lru.insert_cache(model_key, long_tokens, long_cache)
+        reused_cache, remaining = lru.fetch_nearest_cache(model_key, shorter_tokens)
+        self.assertIsNotNone(reused_cache)
+        self.assertEqual(remaining, shorter_tokens[-1:])
+
+        baseline_cache = model.make_cache()
+        mx.eval(model(shorter_array, cache=baseline_cache))
+
+        mx.eval(model(remaining_array, cache=reused_cache))
+        self.assertEqual(
+            [c.offset for c in reused_cache], [c.offset for c in baseline_cache]
+        )
+
+        for tok in continuation_tokens:
+            tok_array = mx.array([[tok]], dtype=mx.int32)
+            reused_logits = model(tok_array, cache=reused_cache)
+            baseline_logits = model(tok_array, cache=baseline_cache)
+            mx.eval(reused_logits, baseline_logits)
+            self.assertTrue(
+                mx.allclose(reused_logits, baseline_logits, rtol=1e-5, atol=1e-5)
+            )
+
+    def test_longer_hit_unrecoverable_rotating_miss_skips_deepcopy(self):
+        class DeepcopyShouldNotRunLayer:
+            @property
+            def nbytes(self):
+                return 1
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                return n
+
+            def __deepcopy__(self, memo):
+                raise AssertionError("deepcopy should be skipped on known-safe miss")
+
+        lru = LRUPromptCache(max_size=10)
+        model = ("skip-deepcopy", None, None)
+        long_tokens = [1, 2, 3, 4]
+        shorter_tokens = [1, 2]
+
+        # Decode-style rotating state with offset beyond materialized backing.
+        # This should be detected as unrecoverable before any deepcopy occurs.
+        unrecoverable = self._build_real_rotating_cache()
+        unrecoverable.offset = unrecoverable.keys.shape[2] + 1
+        unrecoverable._idx = unrecoverable.keys.shape[2]
+
+        lru.insert_cache(
+            model,
+            long_tokens,
+            [DeepcopyShouldNotRunLayer(), unrecoverable],
+        )
+        reused_cache, remaining = lru.fetch_nearest_cache(model, shorter_tokens)
+        self.assertIsNone(reused_cache)
+        self.assertEqual(remaining, shorter_tokens)
+
+        # Safe miss should remain non-destructive for the exact longer entry.
+        exact_cache, exact_remaining = lru.fetch_nearest_cache(model, long_tokens)
+        self.assertIsNotNone(exact_cache)
+        self.assertEqual(exact_remaining, [])
+
     def test_mixed_cache_longer_prefix_reuse_preserves_refcounted_long_entry(self):
         lru = LRUPromptCache(max_size=10)
         model_key = ("step3p5-tiny", None, None)

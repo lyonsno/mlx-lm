@@ -12,9 +12,10 @@ from mlx_lm.generate import (
     batch_generate,
     generate,
     generate_step,
+    speculative_generate_step,
     stream_generate,
 )
-from mlx_lm.models.cache import RotatingKVCache
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
@@ -177,6 +178,71 @@ class TestGenerate(unittest.TestCase):
         self.assertTrue(
             num_embeddings / prefill_step_size < num_prompt_processing_callbacks
         )
+
+    def test_generate_step_rejects_invalid_prefill_step_size(self):
+        class FailFastModel:
+            layers = [object()]
+
+            def make_cache(self):
+                return [KVCache()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                raise RuntimeError("model-call-should-not-happen")
+
+        prompt = mx.array([1], dtype=mx.uint32)
+        model = FailFastModel()
+        for bad_step_size in (0, -1, 1.5, "8", True):
+            with self.assertRaisesRegex(
+                ValueError, "prefill_step_size must be a positive integer"
+            ):
+                next(
+                    generate_step(
+                        prompt=prompt,
+                        model=model,
+                        max_tokens=1,
+                        prefill_step_size=bad_step_size,
+                    )
+                )
+
+    def test_speculative_generate_step_rejects_invalid_prefill_step_size(self):
+        class FailFastModel:
+            layers = [object()]
+
+            def make_cache(self):
+                return [KVCache()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                raise RuntimeError("model-call-should-not-happen")
+
+        prompt = mx.array([1], dtype=mx.uint32)
+        model = FailFastModel()
+        for bad_step_size in (0, -1, 1.5, "8", True):
+            with self.assertRaisesRegex(
+                ValueError, "prefill_step_size must be a positive integer"
+            ):
+                next(
+                    speculative_generate_step(
+                        prompt=prompt,
+                        model=model,
+                        draft_model=model,
+                        max_tokens=1,
+                        prefill_step_size=bad_step_size,
+                    )
+                )
+
+    def test_batch_generator_rejects_non_positive_prefill_step_size(self):
+        for bad_step_size in (0, -8):
+            with self.assertRaisesRegex(
+                ValueError, "prefill_step_size must be a positive integer"
+            ):
+                BatchGenerator(self.model, prefill_step_size=bad_step_size)
+
+    def test_batch_generator_rejects_non_integer_prefill_step_size(self):
+        for bad_step_size in (1.5, "8", True):
+            with self.assertRaisesRegex(
+                ValueError, "prefill_step_size must be a positive integer"
+            ):
+                BatchGenerator(self.model, prefill_step_size=bad_step_size)
 
     def test_batch_matches_single(self):
 
