@@ -15,7 +15,9 @@ def coerce_positive_int(value, *, field_name: str) -> int:
 
 def positive_int(value):
     try:
-        ivalue = int(value) if isinstance(value, str) else value
+        # Keep argparse helper backward-compatible for non-CLI callers that
+        # relied on int() coercion semantics.
+        ivalue = int(value)
         return coerce_positive_int(ivalue, field_name="value")
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise argparse.ArgumentTypeError("must be a positive integer") from exc

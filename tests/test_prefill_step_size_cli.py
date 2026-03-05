@@ -5,6 +5,7 @@ import contextlib
 import io
 import sys
 import unittest
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -152,12 +153,10 @@ class TestPositiveIntValidation(unittest.TestCase):
             ):
                 coerce_positive_int(value, field_name="prefill_step_size")
 
-    def test_argparse_positive_int_wrapper_parses_strings_and_rejects_bools(self):
+    def test_argparse_positive_int_wrapper_preserves_int_coercion_compatibility(self):
         self.assertEqual(positive_int("16"), 16)
-        with self.assertRaisesRegex(
-            argparse.ArgumentTypeError, "must be a positive integer"
-        ):
-            positive_int(True)
+        self.assertEqual(positive_int(Decimal("2")), 2)
+        self.assertEqual(positive_int(1.5), 1)
 
 
 if __name__ == "__main__":
