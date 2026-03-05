@@ -424,6 +424,34 @@ class TestPromptCache(unittest.TestCase):
         self.assertTrue(cache.rewind(2))
         self.assertEqual(cache.offset, 0)
 
+    def test_base_cache_legacy_can_rewind_fails_closed_on_bad_offset_property(self):
+        class BadOffsetCache(_BaseCache):
+            def __init__(self):
+                self.trim_calls = []
+
+            @property
+            def nbytes(self):
+                return 1
+
+            def empty(self):
+                return True
+
+            def is_trimmable(self):
+                return True
+
+            @property
+            def offset(self):
+                raise RuntimeError("offset unavailable")
+
+            def trim(self, n):
+                self.trim_calls.append(n)
+                return n
+
+        cache = BadOffsetCache()
+        self.assertFalse(cache.can_rewind(1))
+        self.assertFalse(cache.rewind(1))
+        self.assertEqual(cache.trim_calls, [])
+
     def test_make_mask_with_cache(self):
         # For 1 time step with no cache, don't need a mask
         mask = create_attention_mask(mx.zeros((1, 1)), cache=None, return_array=False)

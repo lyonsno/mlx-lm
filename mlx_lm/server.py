@@ -293,10 +293,11 @@ class LRUPromptCache:
                 return False
 
         # Compatibility fallback for custom caches that only implement the
-        # legacy is_trimmable()/trim() contract.
+        # legacy is_trimmable()/trim()/rewind() contract.
         is_trimmable = getattr(layer_cache, "is_trimmable", None)
         trim = getattr(layer_cache, "trim", None)
-        if not callable(is_trimmable) or not callable(trim):
+        rewind = getattr(layer_cache, "rewind", None)
+        if not callable(is_trimmable) or (not callable(trim) and not callable(rewind)):
             return False
         try:
             if not bool(is_trimmable()):

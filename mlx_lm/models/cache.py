@@ -159,7 +159,10 @@ class _BaseCache:
 
         # If an offset is present, use it to fail closed before deepcopy on
         # impossible rewinds.
-        offset = getattr(self, "offset", None)
+        try:
+            offset = getattr(self, "offset", None)
+        except Exception:
+            return False
         if isinstance(offset, numbers.Integral):
             return num_to_trim <= int(offset)
 

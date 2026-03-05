@@ -250,6 +250,40 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
         self.assertEqual(exact_remaining, [])
         self.assertEqual(exact_cache[0].offset, 4)
 
+    def test_legacy_rewind_only_layer_without_trim_still_reuses(self):
+        class LegacyRewindOnlyLayer:
+            def __init__(self):
+                self.offset = 4
+
+            @property
+            def nbytes(self):
+                return 1
+
+            def is_trimmable(self):
+                return True
+
+            def rewind(self, n):
+                if n > self.offset:
+                    return False
+                self.offset -= n
+                return True
+
+        lru = LRUPromptCache(max_size=10)
+        model = ("legacy-rewind-only", None, None)
+        long_tokens = [1, 2, 3, 4]
+        shorter_tokens = [1, 2]
+
+        lru.insert_cache(model, long_tokens, [LegacyRewindOnlyLayer()])
+        reused_cache, remaining = lru.fetch_nearest_cache(model, shorter_tokens)
+        self.assertIsNotNone(reused_cache)
+        self.assertEqual(remaining, shorter_tokens[-1:])
+        self.assertEqual(reused_cache[0].offset, 1)
+
+        exact_cache, exact_remaining = lru.fetch_nearest_cache(model, long_tokens)
+        self.assertIsNotNone(exact_cache)
+        self.assertEqual(exact_remaining, [])
+        self.assertEqual(exact_cache[0].offset, 4)
+
     def test_legacy_offset_insufficient_safe_miss_skips_deepcopy(self):
         class LegacyOffsetLimitedLayer:
             def __init__(self):
