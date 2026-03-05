@@ -5,7 +5,7 @@ Hybrid attention models (some full-attention layers with `KVCache`, some sliding
 layers with `RotatingKVCache`) can lose prompt-cache trim/reuse after sliding
 caches fill their fixed window.
 
-Current behavior:
+Pre-fix behavior (before Phase 1):
 - `can_trim_prompt_cache(cache)` requires every cache object to be trimmable.
 - `RotatingKVCache.is_trimmable()` returns `False` once offset reaches max window.
 - Longer->shorter prompt-cache reuse in `LRUPromptCache.fetch_nearest_cache()`
@@ -55,12 +55,12 @@ Legacy compatibility behavior:
 - Supports legacy `is_trimmable + rewind` layers.
 - Uses offset hints where available to avoid guaranteed-miss deepcopy churn.
 
-## Rollout Plan
-1. Add fail-first/regression tests for mixed cache longer->shorter server lookup.
-2. Migrate rewind ownership into cache classes and public APIs.
+## Rollout Plan (Historical, Completed)
+1. Added fail-first/regression tests for mixed cache longer->shorter server lookup.
+2. Migrated rewind ownership into cache classes and public APIs.
 3. Split behavior/integration tests from white-box rewind internals.
-4. Validate on Step3.5 Flash and ensure no prompt-cache regressions.
-5. Add incremental hardening based on reviewer feedback.
+4. Validated on Step3.5 Flash and ensured no prompt-cache regressions.
+5. Added incremental hardening based on reviewer feedback.
 
 ## Risks
 - Precheck false positives/negatives in legacy compatibility paths.
@@ -68,8 +68,8 @@ Legacy compatibility behavior:
 - Hidden mutation during fail-closed branches.
 
 ## Acceptance Criteria
-- Mixed cache longer->shorter reuse returns non-`None` cache where current code
-  returns `None`.
+- Mixed cache longer->shorter reuse returns non-`None` cache where previous code
+  returned `None`.
 - Returned remainder tokens preserve generation correctness and carry-token
   contract.
 - Existing non-mixed cache tests remain green.
