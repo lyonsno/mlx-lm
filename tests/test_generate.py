@@ -13,20 +13,66 @@ from mlx_lm.generate import (
     BatchGenerator,
     GenerationResponse,
     batch_generate,
+    can_rewind_prompt_cache,
     generate,
     generate_step,
     maybe_quantize_kv_cache,
+    rewind_prompt_cache,
     speculative_generate_step,
     stream_generate,
 )
-from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
+from mlx_lm.models.cache import (
+    KVCache,
+    QuantizedKVCache,
+    RotatingKVCache,
+    can_trim_prompt_cache,
+)
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
+from mlx_lm.tokenizer_utils import TokenizerWrapper
 from mlx_lm.utils import load
 
 generate_module = importlib.import_module("mlx_lm.generate")
 
 
 class TestKVBitsCoverage(unittest.TestCase):
+    @staticmethod
+    def _make_tiny_step3p5_model():
+        from mlx_lm.models import step3p5
+
+        args = step3p5.ModelArgs.from_dict(
+            {
+                "model_type": "step3p5",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "vocab_size": 256,
+                "num_attention_heads": 4,
+                "num_attention_groups": 2,
+                "head_dim": 32,
+                "intermediate_size": 256,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": [10000.0, 10000.0, 10000.0, 10000.0],
+                "sliding_window": 4,
+                "layer_types": [
+                    "full_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "partial_rotary_factors": [1.0, 1.0, 1.0, 1.0],
+                "attention_other_setting": {
+                    "num_attention_heads": 4,
+                    "num_attention_groups": 2,
+                },
+                "use_head_wise_attn_gate": True,
+                "moe_num_experts": 4,
+                "moe_top_k": 2,
+                "moe_intermediate_size": 128,
+                "share_expert_dim": 128,
+                "moe_layers_enum": "1,2,3",
+            }
+        )
+        return step3p5.Model(args)
+
     def test_maybe_quantize_kv_cache_honors_threshold_and_none_bits(self):
         class QuantizedCache:
             def __init__(self, bits, group_size):
@@ -77,6 +123,226 @@ class TestKVBitsCoverage(unittest.TestCase):
         self.assertEqual(prompt_cache[1].bits, 4)
         self.assertEqual(prompt_cache[1].group_size, 32)
 
+    def test_generate_step_step3p5_kv_bits_skips_rotating_cache_quantization(self):
+        model = self._make_tiny_step3p5_model()
+        prompt_cache = model.make_cache()
+
+        prompt = mx.array([1, 2, 3, 4, 5, 6, 7, 8], dtype=mx.uint32)
+        next(
+            generate_step(
+                prompt=prompt,
+                model=model,
+                prompt_cache=prompt_cache,
+                max_tokens=1,
+                kv_bits=4,
+                kv_group_size=32,
+                quantized_kv_start=0,
+            )
+        )
+
+        self.assertGreater(
+            sum(isinstance(c, QuantizedKVCache) for c in prompt_cache), 0
+        )
+        self.assertGreater(sum(isinstance(c, RotatingKVCache) for c in prompt_cache), 0)
+
+    def test_rewind_prompt_cache_rewinds_step3p5_mixed_saturated_cache(self):
+        model = self._make_tiny_step3p5_model()
+        prompt_cache = model.make_cache()
+
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=mx.int32)
+        mx.eval(model(prompt, cache=prompt_cache))
+
+        self.assertFalse(can_trim_prompt_cache(prompt_cache))
+        offsets_before = [c.offset for c in prompt_cache]
+        self.assertTrue(rewind_prompt_cache(prompt_cache, 1))
+        self.assertEqual(
+            [c.offset for c in prompt_cache], [o - 1 for o in offsets_before]
+        )
+
+    def test_rewind_prompt_cache_fails_closed_without_partial_mutation(self):
+        class RewindLayer:
+            def __init__(self, *, offset, can_rewind_result, rewind_result):
+                self.offset = offset
+                self.can_rewind_result = can_rewind_result
+                self.rewind_result = rewind_result
+                self.can_rewind_calls = []
+                self.rewind_calls = []
+
+            def can_rewind(self, n):
+                self.can_rewind_calls.append(n)
+                return self.can_rewind_result
+
+            def rewind(self, n):
+                self.rewind_calls.append(n)
+                self.offset -= n
+                return self.rewind_result
+
+        first = RewindLayer(offset=9, can_rewind_result=True, rewind_result=True)
+        second = RewindLayer(offset=9, can_rewind_result=False, rewind_result=False)
+        prompt_cache = [first, second]
+
+        self.assertFalse(rewind_prompt_cache(prompt_cache, 2))
+        self.assertEqual(first.offset, 9)
+        self.assertEqual(second.offset, 9)
+        self.assertEqual(first.rewind_calls, [])
+        self.assertEqual(second.rewind_calls, [])
+
+    def test_maybe_quantize_kv_cache_caches_non_quantizable_layers(self):
+        class UnsupportedQuantCache:
+            def __init__(self, offset):
+                self.offset = offset
+                self.calls = 0
+
+            def to_quantized(self, group_size, bits):
+                self.calls += 1
+                raise NotImplementedError("quantization unsupported")
+
+        unsupported = UnsupportedQuantCache(offset=32)
+        prompt_cache = [unsupported]
+
+        for _ in range(3):
+            maybe_quantize_kv_cache(
+                prompt_cache,
+                quantized_kv_start=0,
+                kv_group_size=32,
+                kv_bits=4,
+            )
+
+        self.assertEqual(unsupported.calls, 1)
+
+    def test_maybe_quantize_kv_cache_retries_for_different_quantization_config(self):
+        class ConfigSensitiveQuantCache:
+            def __init__(self, offset):
+                self.offset = offset
+                self.calls = []
+
+            def to_quantized(self, group_size, bits):
+                self.calls.append((group_size, bits))
+                if bits == 4:
+                    raise NotImplementedError("4-bit unsupported")
+                return QuantizedKVCache(bits=bits, group_size=group_size)
+
+        cache_layer = ConfigSensitiveQuantCache(offset=32)
+        prompt_cache = [cache_layer]
+
+        maybe_quantize_kv_cache(
+            prompt_cache,
+            quantized_kv_start=0,
+            kv_group_size=32,
+            kv_bits=4,
+        )
+        maybe_quantize_kv_cache(
+            prompt_cache,
+            quantized_kv_start=0,
+            kv_group_size=32,
+            kv_bits=8,
+        )
+
+        self.assertEqual(cache_layer.calls, [(32, 4), (32, 8)])
+        self.assertIsInstance(prompt_cache[0], QuantizedKVCache)
+        self.assertEqual(prompt_cache[0].bits, 8)
+        self.assertEqual(prompt_cache[0].group_size, 32)
+
+    def test_can_rewind_prompt_cache_requires_callable_rewind_or_trim(self):
+        class RewindableLayer:
+            def __init__(self, offset):
+                self.offset = offset
+                self.rewind_calls = []
+
+            def can_rewind(self, n):
+                return True
+
+            def rewind(self, n):
+                self.rewind_calls.append(n)
+                self.offset -= n
+                return True
+
+        class CanOnlyLayer:
+            def can_rewind(self, n):
+                return True
+
+        first = RewindableLayer(offset=9)
+        second = CanOnlyLayer()
+        prompt_cache = [first, second]
+
+        self.assertFalse(can_rewind_prompt_cache(prompt_cache, 2))
+        self.assertFalse(rewind_prompt_cache(prompt_cache, 2))
+        self.assertEqual(first.offset, 9)
+        self.assertEqual(first.rewind_calls, [])
+
+    def test_rewind_prompt_cache_rolls_back_nested_mutable_state(self):
+        class NestedStateLayer:
+            def __init__(self):
+                self.state = [[10]]
+
+            def can_rewind(self, n):
+                return True
+
+            def rewind(self, n):
+                self.state[0][0] -= n
+                return False
+
+        layer = NestedStateLayer()
+        self.assertFalse(rewind_prompt_cache([layer], 2))
+        self.assertEqual(layer.state, [[10]])
+
+    def test_rewind_prompt_cache_rolls_back_nested_custom_object_state(self):
+        class Box:
+            def __init__(self, value):
+                self.value = value
+
+        class CustomObjectStateLayer:
+            def __init__(self):
+                self.state = {"box": Box(10)}
+
+            def can_rewind(self, n):
+                return True
+
+            def rewind(self, n):
+                self.state["box"].value -= n
+                return False
+
+        layer = CustomObjectStateLayer()
+        self.assertFalse(rewind_prompt_cache([layer], 2))
+        self.assertEqual(layer.state["box"].value, 10)
+
+    def test_can_rewind_prompt_cache_requires_snapshotable_layers(self):
+        class UnsnapshotableLayer:
+            __slots__ = ()
+
+            def can_rewind(self, n):
+                return True
+
+            def rewind(self, n):
+                return True
+
+        layer = UnsnapshotableLayer()
+        self.assertFalse(can_rewind_prompt_cache([layer], 1))
+        self.assertFalse(rewind_prompt_cache([layer], 1))
+
+    def test_rewind_prompt_cache_cyclic_state_fails_closed_without_exception(self):
+        class CyclicStateLayer:
+            def __init__(self):
+                self.offset = 10
+                self.state = []
+                self.state.append(self.state)
+
+            def can_rewind(self, n):
+                return True
+
+            def rewind(self, n):
+                self.offset -= n
+                return True
+
+        layer = CyclicStateLayer()
+        self.assertFalse(can_rewind_prompt_cache([layer], 1))
+        try:
+            result = rewind_prompt_cache([layer], 1)
+        except RecursionError as exc:
+            self.fail(f"rewind_prompt_cache raised RecursionError: {exc}")
+        self.assertFalse(result)
+        self.assertEqual(layer.offset, 10)
+
     def test_generate_step_quantizes_eligible_cache_layer(self):
         class QuantizedCache:
             def __init__(self, bits, group_size):
@@ -121,6 +387,660 @@ class TestKVBitsCoverage(unittest.TestCase):
         self.assertIsInstance(prompt_cache[0], QuantizedCache)
         self.assertEqual(prompt_cache[0].bits, 6)
         self.assertEqual(prompt_cache[0].group_size, 16)
+
+    def test_speculative_generate_step_raises_on_rewind_failure(self):
+        class NonRewindCache:
+            offset = 8
+
+            def is_trimmable(self):
+                return False
+
+            def rewind(self, n):
+                return False
+
+        class FixedTokenModel:
+            layers = [object()]
+
+            def __init__(self, forced_token):
+                self.forced_token = forced_token
+
+            def make_cache(self):
+                return [NonRewindCache()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == self.forced_token)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+        gen = speculative_generate_step(
+            prompt=prompt,
+            model=FixedTokenModel(forced_token=0),
+            draft_model=FixedTokenModel(forced_token=1),
+            max_tokens=2,
+            num_draft_tokens=2,
+        )
+        next(gen)
+        with self.assertRaisesRegex(
+            RuntimeError, "Speculative decoding cache rewind failed"
+        ):
+            next(gen)
+        gen.close()
+
+    def test_speculative_generate_step_rewind_failure_keeps_caller_cache_unchanged(
+        self,
+    ):
+        class RewindLayer:
+            def __init__(self, *, offset, can_rewind_result, rewind_result):
+                self.offset = offset
+                self.can_rewind_result = can_rewind_result
+                self.rewind_result = rewind_result
+                self.rewind_calls = []
+
+            def can_rewind(self, n):
+                return self.can_rewind_result
+
+            def rewind(self, n):
+                self.rewind_calls.append(n)
+                if self.rewind_result:
+                    self.offset -= n
+                return self.rewind_result
+
+        class FixedTokenModel:
+            def __init__(self, forced_token, num_layers):
+                self.forced_token = forced_token
+                self.layers = [object() for _ in range(num_layers)]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == self.forced_token)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        model_cache_ok = RewindLayer(
+            offset=12, can_rewind_result=True, rewind_result=True
+        )
+        model_cache_fail = RewindLayer(
+            offset=12, can_rewind_result=False, rewind_result=False
+        )
+        draft_cache = RewindLayer(offset=12, can_rewind_result=True, rewind_result=True)
+        prompt_cache = [model_cache_ok, model_cache_fail, draft_cache]
+
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+        gen = speculative_generate_step(
+            prompt=prompt,
+            model=FixedTokenModel(forced_token=0, num_layers=2),
+            draft_model=FixedTokenModel(forced_token=1, num_layers=1),
+            prompt_cache=prompt_cache,
+            max_tokens=2,
+            num_draft_tokens=2,
+        )
+        next(gen)
+        with self.assertRaisesRegex(
+            RuntimeError, "Speculative decoding cache rewind failed"
+        ):
+            next(gen)
+
+        self.assertEqual(model_cache_ok.offset, 12)
+        self.assertEqual(model_cache_fail.offset, 12)
+        self.assertEqual(draft_cache.offset, 12)
+        self.assertEqual(model_cache_ok.rewind_calls, [])
+        self.assertEqual(model_cache_fail.rewind_calls, [])
+        self.assertEqual(draft_cache.rewind_calls, [])
+
+    def test_speculative_generate_step_preserves_primary_exception_on_cleanup_failure(
+        self,
+    ):
+        class NonRewindCache:
+            offset = 8
+
+            def can_rewind(self, n):
+                return False
+
+            def rewind(self, n):
+                return False
+
+        class TargetModel:
+            layers = [object()]
+
+            def make_cache(self):
+                return [NonRewindCache()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (2000.0 * (mx.arange(vocab_size) == 0))
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        class FailingDraftModel:
+            layers = [object()]
+
+            def make_cache(self):
+                return [NonRewindCache()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                raise ValueError("draft boom")
+
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+        with self.assertRaisesRegex(ValueError, "draft boom"):
+            next(
+                speculative_generate_step(
+                    prompt=prompt,
+                    model=TargetModel(),
+                    draft_model=FailingDraftModel(),
+                    max_tokens=2,
+                    num_draft_tokens=2,
+                )
+            )
+
+    def test_speculative_generate_step_close_triggers_best_effort_rewind(self):
+        class TrackingLayer:
+            def __init__(self, offset):
+                self.offset = offset
+                self.rewind_calls = []
+
+            def can_rewind(self, n):
+                return n <= self.offset
+
+            def rewind(self, n):
+                self.rewind_calls.append(n)
+                self.offset -= n
+                return True
+
+        class FixedTokenModel:
+            def __init__(self, forced_token, num_layers):
+                self.forced_token = forced_token
+                self.layers = [object() for _ in range(num_layers)]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == self.forced_token)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        model_cache = TrackingLayer(offset=12)
+        draft_cache = TrackingLayer(offset=12)
+        prompt_cache = [model_cache, draft_cache]
+
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+        gen = speculative_generate_step(
+            prompt=prompt,
+            model=FixedTokenModel(forced_token=0, num_layers=1),
+            draft_model=FixedTokenModel(forced_token=1, num_layers=1),
+            prompt_cache=prompt_cache,
+            max_tokens=2,
+            num_draft_tokens=2,
+        )
+        next(gen)
+        self.assertEqual(model_cache.rewind_calls, [])
+        self.assertEqual(draft_cache.rewind_calls, [])
+        gen.close()
+        self.assertEqual(model_cache.rewind_calls, [2])
+        self.assertEqual(draft_cache.rewind_calls, [1])
+
+    def test_speculative_generate_step_draft_preflight_failure_does_not_mutate_model(
+        self,
+    ):
+        class TrackingLayer:
+            def __init__(self, *, offset, can_rewind_result, rewind_result):
+                self.offset = offset
+                self.can_rewind_result = can_rewind_result
+                self.rewind_result = rewind_result
+                self.rewind_calls = []
+
+            def can_rewind(self, n):
+                return self.can_rewind_result
+
+            def rewind(self, n):
+                self.rewind_calls.append(n)
+                if self.rewind_result:
+                    self.offset -= n
+                return self.rewind_result
+
+        class FixedTokenModel:
+            def __init__(self, forced_token):
+                self.forced_token = forced_token
+                self.layers = [object()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == self.forced_token)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        model_cache = TrackingLayer(
+            offset=12, can_rewind_result=True, rewind_result=True
+        )
+        draft_cache = TrackingLayer(
+            offset=12, can_rewind_result=False, rewind_result=False
+        )
+        prompt_cache = [model_cache, draft_cache]
+
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+        gen = speculative_generate_step(
+            prompt=prompt,
+            model=FixedTokenModel(forced_token=0),
+            draft_model=FixedTokenModel(forced_token=1),
+            prompt_cache=prompt_cache,
+            max_tokens=2,
+            num_draft_tokens=2,
+        )
+        next(gen)
+        with self.assertRaisesRegex(
+            RuntimeError, "Speculative decoding cache rewind failed for draft cache"
+        ):
+            next(gen)
+
+        self.assertEqual(model_cache.offset, 12)
+        self.assertEqual(model_cache.rewind_calls, [])
+        self.assertEqual(draft_cache.offset, 12)
+        self.assertEqual(draft_cache.rewind_calls, [])
+
+    def test_speculative_generate_step_draft_rewind_failure_does_not_mutate_model(
+        self,
+    ):
+        class TrackingLayer:
+            def __init__(self, *, offset, can_rewind_result, rewind_result):
+                self.offset = offset
+                self.can_rewind_result = can_rewind_result
+                self.rewind_result = rewind_result
+                self.rewind_calls = []
+
+            def can_rewind(self, n):
+                return self.can_rewind_result
+
+            def rewind(self, n):
+                self.rewind_calls.append(n)
+                if self.rewind_result:
+                    self.offset -= n
+                return self.rewind_result
+
+        class FixedTokenModel:
+            def __init__(self, forced_token):
+                self.forced_token = forced_token
+                self.layers = [object()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == self.forced_token)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        model_cache = TrackingLayer(
+            offset=12, can_rewind_result=True, rewind_result=True
+        )
+        draft_cache = TrackingLayer(
+            offset=12, can_rewind_result=True, rewind_result=False
+        )
+        prompt_cache = [model_cache, draft_cache]
+
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+        gen = speculative_generate_step(
+            prompt=prompt,
+            model=FixedTokenModel(forced_token=0),
+            draft_model=FixedTokenModel(forced_token=1),
+            prompt_cache=prompt_cache,
+            max_tokens=2,
+            num_draft_tokens=2,
+        )
+        next(gen)
+        with self.assertRaisesRegex(
+            RuntimeError, "Speculative decoding cache rewind failed for draft cache"
+        ):
+            next(gen)
+
+        self.assertEqual(model_cache.offset, 12)
+        self.assertEqual(model_cache.rewind_calls, [])
+        self.assertEqual(draft_cache.offset, 12)
+        self.assertEqual(draft_cache.rewind_calls, [])
+
+    def test_speculative_generate_step_draft_snapshot_failure_reports_draft_cache(
+        self,
+    ):
+        class ModelLayer:
+            def __init__(self, offset):
+                self.offset = offset
+
+            def can_rewind(self, n):
+                return True
+
+            def rewind(self, n):
+                self.offset -= n
+                return True
+
+        class UnsnapshotableDraftLayer:
+            __slots__ = ()
+
+            def can_rewind(self, n):
+                return True
+
+            def rewind(self, n):
+                return True
+
+        class FixedTokenModel:
+            def __init__(self, forced_token):
+                self.forced_token = forced_token
+                self.layers = [object()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == self.forced_token)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+        gen = speculative_generate_step(
+            prompt=prompt,
+            model=FixedTokenModel(forced_token=0),
+            draft_model=FixedTokenModel(forced_token=1),
+            prompt_cache=[ModelLayer(offset=12), UnsnapshotableDraftLayer()],
+            max_tokens=2,
+            num_draft_tokens=2,
+        )
+        next(gen)
+        with self.assertRaisesRegex(
+            RuntimeError, "Speculative decoding cache rewind failed for draft cache"
+        ):
+            next(gen)
+
+    def test_rewind_prompt_cache_legacy_trim_only_layer_still_rewinds(self):
+        class LegacyTrimOnlyLayer:
+            def __init__(self):
+                self.trim_calls = []
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                self.trim_calls.append(n)
+                return n
+
+        layer = LegacyTrimOnlyLayer()
+        self.assertTrue(rewind_prompt_cache([layer], 3))
+        self.assertEqual(layer.trim_calls, [3])
+
+    def test_speculative_generate_step_surfaces_cleanup_rewind_failure_on_success_path(
+        self,
+    ):
+        class NonRewindCache:
+            offset = 8
+
+            def can_rewind(self, n):
+                return False
+
+            def rewind(self, n):
+                return False
+
+        class FixedTokenModel:
+            layers = [object()]
+
+            def __init__(self, forced_token):
+                self.forced_token = forced_token
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == self.forced_token)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+        gen = speculative_generate_step(
+            prompt=prompt,
+            model=FixedTokenModel(forced_token=0),
+            draft_model=FixedTokenModel(forced_token=1),
+            prompt_cache=[NonRewindCache(), NonRewindCache()],
+            max_tokens=1,
+            num_draft_tokens=1,
+        )
+        next(gen)
+        with self.assertRaisesRegex(
+            RuntimeError, "Speculative decoding cache rewind failed"
+        ):
+            next(gen)
+
+    def test_speculative_generate_step_zero_trim_rewind_skips_snapshot_requirements(
+        self,
+    ):
+        class UnsnapshotableLayer:
+            __slots__ = ()
+
+            def can_rewind(self, n):
+                return True
+
+            def rewind(self, n):
+                return True
+
+        class FixedTokenModel:
+            def __init__(self, forced_token):
+                self.forced_token = forced_token
+                self.layers = [object()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == self.forced_token)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+        gen = speculative_generate_step(
+            prompt=prompt,
+            model=FixedTokenModel(forced_token=0),
+            draft_model=FixedTokenModel(forced_token=0),
+            prompt_cache=[UnsnapshotableLayer(), UnsnapshotableLayer()],
+            max_tokens=1,
+            num_draft_tokens=1,
+        )
+        token, _logprobs, from_draft = next(gen)
+        self.assertEqual(token, 0)
+        self.assertTrue(from_draft)
+        with self.assertRaises(StopIteration):
+            next(gen)
+
+    def test_stream_generate_speculative_eos_break_rewinds_caller_prompt_cache(self):
+        class TrackingCache:
+            def __init__(self, offset):
+                self.offset = offset
+                self.rewind_calls = []
+
+            def can_rewind(self, n):
+                return n <= self.offset
+
+            def rewind(self, n):
+                self.rewind_calls.append(n)
+                self.offset -= n
+                return True
+
+        class FixedTokenModel:
+            def __init__(self, forced_token):
+                self.forced_token = forced_token
+                self.layers = [object()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                if cache is not None:
+                    for layer_cache in cache:
+                        layer_cache.offset += input_tokens.shape[1]
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == self.forced_token)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        class StubTokenizer:
+            eos_token_id = 0
+            chat_template = None
+
+            @staticmethod
+            def get_vocab():
+                return {}
+
+        class StubDetokenizer:
+            def __init__(self, _tokenizer):
+                self.reset()
+
+            def reset(self):
+                self.tokens = []
+                self.text = ""
+                self.offset = 0
+
+            def add_token(self, token):
+                self.tokens.append(token)
+                self.text += "x"
+
+            def finalize(self):
+                return None
+
+            @property
+            def last_segment(self):
+                segment = self.text[self.offset :]
+                self.offset = len(self.text)
+                return segment
+
+        tokenizer = TokenizerWrapper(
+            StubTokenizer(),
+            detokenizer_class=StubDetokenizer,
+            eos_token_ids=[0],
+        )
+
+        model_cache = TrackingCache(offset=20)
+        draft_cache = TrackingCache(offset=20)
+        prompt_cache = [model_cache, draft_cache]
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+
+        responses = list(
+            stream_generate(
+                model=FixedTokenModel(forced_token=0),
+                tokenizer=tokenizer,
+                prompt=prompt,
+                max_tokens=4,
+                draft_model=FixedTokenModel(forced_token=1),
+                prompt_cache=prompt_cache,
+                num_draft_tokens=2,
+            )
+        )
+
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0].finish_reason, "stop")
+        self.assertEqual(responses[0].token, 0)
+        self.assertEqual(model_cache.rewind_calls, [2])
+        self.assertEqual(draft_cache.rewind_calls, [1])
+        self.assertEqual(model_cache.offset, 23)
+        self.assertEqual(draft_cache.offset, 23)
+
+    def test_rewind_prompt_cache_snapshots_once_per_call(self):
+        class CountedBox:
+            copies = 0
+
+            def __init__(self, value):
+                self.value = value
+
+            def __deepcopy__(self, memo):
+                type(self).copies += 1
+                copied = CountedBox(self.value)
+                memo[id(self)] = copied
+                return copied
+
+        class RewindLayer:
+            def __init__(self):
+                self.offset = 8
+                self.box = CountedBox(10)
+
+            def can_rewind(self, n):
+                return n <= self.offset
+
+            def rewind(self, n):
+                self.offset -= n
+                return True
+
+        CountedBox.copies = 0
+        layer = RewindLayer()
+        self.assertTrue(rewind_prompt_cache([layer], 1))
+        self.assertEqual(CountedBox.copies, 1)
+
+    def test_speculative_generate_step_rewind_snapshots_once_per_cycle(self):
+        class CountedBox:
+            copies = 0
+
+            def __init__(self, value):
+                self.value = value
+
+            def __deepcopy__(self, memo):
+                type(self).copies += 1
+                copied = CountedBox(self.value)
+                memo[id(self)] = copied
+                return copied
+
+        class RewindLayer:
+            def __init__(self):
+                self.offset = 12
+                self.box = CountedBox(10)
+
+            def can_rewind(self, n):
+                return n <= self.offset
+
+            def rewind(self, n):
+                self.offset -= n
+                return True
+
+        class FixedTokenModel:
+            def __init__(self, forced_token):
+                self.forced_token = forced_token
+                self.layers = [object()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == self.forced_token)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        CountedBox.copies = 0
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+        prompt_cache = [RewindLayer(), RewindLayer()]
+
+        gen = speculative_generate_step(
+            prompt=prompt,
+            model=FixedTokenModel(forced_token=0),
+            draft_model=FixedTokenModel(forced_token=1),
+            prompt_cache=prompt_cache,
+            max_tokens=4,
+            num_draft_tokens=1,
+        )
+        token, _logprobs, from_draft = next(gen)
+        self.assertEqual(token, 0)
+        self.assertFalse(from_draft)
+        gen.close()
+
+        self.assertEqual(CountedBox.copies, 1)
 
     def test_generate_main_raises_for_prompt_cache_kv_bits_mismatch(self):
         with patch.object(

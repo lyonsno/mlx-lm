@@ -2,8 +2,10 @@
 
 import argparse
 import contextlib
+import copy
 import functools
 import json
+import numbers
 import sys
 import time
 from dataclasses import dataclass
@@ -51,6 +53,8 @@ DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
+_NON_QUANTIZABLE_KV_CACHE_MARKER = "_mlx_kv_quantization_unsupported"
+_UNSNAPSHOTABLE = object()
 
 
 def str2bool(string):
@@ -296,9 +300,274 @@ class GenerationResponse:
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
     if kv_bits is None:
         return
+    quantization_config = (kv_group_size, kv_bits)
     for e, c in enumerate(prompt_cache):
-        if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
-            prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
+        unsupported_configs = getattr(c, _NON_QUANTIZABLE_KV_CACHE_MARKER, None)
+        if unsupported_configs is True:
+            continue
+        if (
+            isinstance(unsupported_configs, set)
+            and quantization_config in unsupported_configs
+        ):
+            continue
+        to_quantized = getattr(c, "to_quantized", None)
+        if not callable(to_quantized):
+            continue
+        offset = getattr(c, "offset", 0)
+        if offset < quantized_kv_start:
+            continue
+        try:
+            prompt_cache[e] = to_quantized(group_size=kv_group_size, bits=kv_bits)
+        except NotImplementedError:
+            # Mixed cache layouts (for example rotating/sliding layers) may
+            # include cache types without KV quantization support.
+            with contextlib.suppress(Exception):
+                if isinstance(unsupported_configs, set):
+                    unsupported_configs.add(quantization_config)
+                else:
+                    setattr(c, _NON_QUANTIZABLE_KV_CACHE_MARKER, {quantization_config})
+            continue
+
+
+def _can_rewind_layer_cache(layer_cache, num_to_trim):
+    can_rewind = getattr(layer_cache, "can_rewind", None)
+    if callable(can_rewind):
+        rewind = getattr(layer_cache, "rewind", None)
+        if not callable(rewind):
+            return False
+        try:
+            return bool(can_rewind(num_to_trim))
+        except Exception:
+            return False
+
+    # Compatibility fallback for custom caches that only implement the
+    # legacy is_trimmable()/trim() contract.
+    is_trimmable = getattr(layer_cache, "is_trimmable", None)
+    trim = getattr(layer_cache, "trim", None)
+    if not callable(is_trimmable) or not callable(trim):
+        return False
+    try:
+        if not bool(is_trimmable()):
+            return False
+        offset = getattr(layer_cache, "offset", None)
+        if isinstance(offset, numbers.Integral):
+            return num_to_trim <= int(offset)
+        # Some legacy/custom caches only expose is_trimmable()/trim() and no
+        # explicit offset. Treat those as rewindable in preflight and let the
+        # actual trim result enforce fail-closed behavior.
+        return True
+    except Exception:
+        return False
+
+
+def _rewind_layer_cache(layer_cache, num_to_trim):
+    rewind = getattr(layer_cache, "rewind", None)
+    if callable(rewind):
+        try:
+            return bool(rewind(num_to_trim))
+        except Exception:
+            return False
+
+    # Compatibility fallback for custom caches that only implement the
+    # legacy is_trimmable()/trim() contract.
+    is_trimmable = getattr(layer_cache, "is_trimmable", None)
+    trim = getattr(layer_cache, "trim", None)
+    if not callable(is_trimmable) or not callable(trim):
+        return False
+    try:
+        return bool(is_trimmable()) and trim(num_to_trim) == num_to_trim
+    except Exception:
+        return False
+
+
+def _snapshot_attr_value(value, memo=None, stack=None):
+    if memo is None:
+        memo = {}
+    if stack is None:
+        stack = set()
+
+    value_id = id(value)
+    # Fail closed on recursive container cycles.
+    if value_id in stack:
+        return _UNSNAPSHOTABLE
+
+    if value_id in memo:
+        return memo[value_id]
+
+    if isinstance(value, list):
+        stack.add(value_id)
+        copied = []
+        memo[value_id] = copied
+        for v in value:
+            copied_value = _snapshot_attr_value(v, memo, stack)
+            if copied_value is _UNSNAPSHOTABLE:
+                return _UNSNAPSHOTABLE
+            copied.append(copied_value)
+        stack.remove(value_id)
+        return copied
+    if isinstance(value, tuple):
+        stack.add(value_id)
+        copied_values = []
+        memo[value_id] = copied_values
+        for v in value:
+            copied_value = _snapshot_attr_value(v, memo, stack)
+            if copied_value is _UNSNAPSHOTABLE:
+                return _UNSNAPSHOTABLE
+            copied_values.append(copied_value)
+        copied_tuple = tuple(copied_values)
+        memo[value_id] = copied_tuple
+        stack.remove(value_id)
+        return copied_tuple
+    if isinstance(value, dict):
+        stack.add(value_id)
+        copied = {}
+        memo[value_id] = copied
+        for k, v in value.items():
+            copied_key = _snapshot_attr_value(k, memo, stack)
+            if copied_key is _UNSNAPSHOTABLE:
+                return _UNSNAPSHOTABLE
+            copied_value = _snapshot_attr_value(v, memo, stack)
+            if copied_value is _UNSNAPSHOTABLE:
+                return _UNSNAPSHOTABLE
+            copied[copied_key] = copied_value
+        stack.remove(value_id)
+        return copied
+    if isinstance(value, set):
+        stack.add(value_id)
+        copied = set()
+        memo[value_id] = copied
+        for v in value:
+            copied_value = _snapshot_attr_value(v, memo, stack)
+            if copied_value is _UNSNAPSHOTABLE:
+                return _UNSNAPSHOTABLE
+            copied.add(copied_value)
+        stack.remove(value_id)
+        return copied
+
+    if isinstance(value, (int, float, str, bool, bytes, type(None))):
+        memo[value_id] = value
+        return value
+
+    try:
+        copied = copy.deepcopy(value)
+    except Exception:
+        return _UNSNAPSHOTABLE
+    memo[value_id] = copied
+    return copied
+
+
+def _iter_slots(obj):
+    for cls in type(obj).mro():
+        slots = getattr(cls, "__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for slot in slots:
+            if slot != "__weakref__":
+                yield slot
+
+
+def _snapshot_layer_cache(layer_cache):
+    if hasattr(layer_cache, "__dict__"):
+        memo = {}
+        stack = set()
+        state = {
+            key: _snapshot_attr_value(value, memo, stack)
+            for key, value in layer_cache.__dict__.items()
+        }
+        if any(v is _UNSNAPSHOTABLE for v in state.values()):
+            return None
+        return ("dict", state)
+
+    memo = {}
+    stack = set()
+    slots = {}
+    for slot in _iter_slots(layer_cache):
+        if hasattr(layer_cache, slot):
+            snap_value = _snapshot_attr_value(getattr(layer_cache, slot), memo, stack)
+            if snap_value is _UNSNAPSHOTABLE:
+                return None
+            slots[slot] = snap_value
+    if slots:
+        return ("slots", slots)
+
+    return None
+
+
+def _restore_layer_cache(layer_cache, snapshot):
+    if snapshot is None:
+        return
+    mode, state = snapshot
+    if mode == "dict":
+        layer_cache.__dict__.clear()
+        layer_cache.__dict__.update(state)
+        return
+    for slot, value in state.items():
+        setattr(layer_cache, slot, value)
+
+
+def _snapshot_prompt_cache(prompt_cache):
+    snapshots = []
+    for layer_cache in prompt_cache:
+        snapshot = _snapshot_layer_cache(layer_cache)
+        if snapshot is None:
+            return None
+        snapshots.append((layer_cache, snapshot))
+    return snapshots
+
+
+def _restore_prompt_cache(snapshots):
+    if snapshots is None:
+        return
+    for layer_cache, snapshot in snapshots:
+        _restore_layer_cache(layer_cache, snapshot)
+
+
+def _can_rewind_layers(prompt_cache, num_to_trim):
+    if num_to_trim <= 0:
+        return True
+    return all(
+        _can_rewind_layer_cache(layer_cache, num_to_trim)
+        for layer_cache in prompt_cache
+    )
+
+
+def _rewind_prompt_cache_from_snapshot(prompt_cache, num_to_trim, snapshots):
+    if num_to_trim <= 0:
+        return True
+    if snapshots is None:
+        return False
+
+    for layer_cache, _ in snapshots:
+        if not _rewind_layer_cache(layer_cache, num_to_trim):
+            _restore_prompt_cache(snapshots)
+            return False
+    return True
+
+
+def rewind_prompt_cache(prompt_cache, num_to_trim):
+    if num_to_trim <= 0:
+        return True
+
+    # Preflight all layers before mutating caller-owned cache state.
+    if not _can_rewind_layers(prompt_cache, num_to_trim):
+        return False
+
+    snapshots = _snapshot_prompt_cache(prompt_cache)
+    if snapshots is None:
+        return False
+
+    return _rewind_prompt_cache_from_snapshot(prompt_cache, num_to_trim, snapshots)
+
+
+def can_rewind_prompt_cache(prompt_cache, num_to_trim):
+    if num_to_trim <= 0:
+        return True
+
+    # Preflight all layers before mutating caller-owned cache state.
+    if not _can_rewind_layers(prompt_cache, num_to_trim):
+        return False
+
+    return _snapshot_prompt_cache(prompt_cache) is not None
 
 
 def _validate_prefill_step_size(prefill_step_size: int) -> int:
@@ -505,7 +774,7 @@ def speculative_generate_step(
           A list of functions that take tokens and logits and return the processed
           logits. Default: ``None``.
         prompt_cache (List[Any], optional): A pre-computed prompt cache. Note, if
-          provided, the cache will be updated in place. The cache must be trimmable.
+          provided, the cache will be updated in place. The cache must be rewindable.
         prefill_step_size (int): Step size for processing the prompt.
         kv_bits (int, optional): Number of bits to use for KV cache quantization.
           None implies no cache quantization. Default: ``None``.
@@ -582,9 +851,72 @@ def speculative_generate_step(
             mx.clear_cache()
         return y
 
+    rewind_failed = False
+
     def _rewind_cache(num_draft, num_accept):
-        cache.trim_prompt_cache(model_cache, num_draft - num_accept)
-        cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+        nonlocal rewind_failed
+        num_model_tokens = num_draft - num_accept
+        num_draft_tokens_to_trim = max(num_draft - num_accept - 1, 0)
+
+        # Zero-trim rewinds are no-ops; avoid snapshot/preflight on unsnapshotable
+        # caches when nothing needs to be rewound.
+        if num_model_tokens <= 0 and num_draft_tokens_to_trim <= 0:
+            return
+
+        model_snapshot = None
+        draft_snapshot = None
+
+        if num_model_tokens > 0:
+            if not _can_rewind_layers(model_cache, num_model_tokens):
+                rewind_failed = True
+                raise RuntimeError(
+                    "Speculative decoding cache rewind failed for model cache. "
+                    "Disable speculative decoding or use a rewindable cache state."
+                )
+            model_snapshot = _snapshot_prompt_cache(model_cache)
+            if model_snapshot is None:
+                rewind_failed = True
+                raise RuntimeError(
+                    "Speculative decoding cache rewind failed for model cache. "
+                    "Disable speculative decoding or use a rewindable cache state."
+                )
+
+        if num_draft_tokens_to_trim > 0:
+            if not _can_rewind_layers(draft_cache, num_draft_tokens_to_trim):
+                rewind_failed = True
+                raise RuntimeError(
+                    "Speculative decoding cache rewind failed for draft cache. "
+                    "Disable speculative decoding or use a rewindable cache state."
+                )
+            draft_snapshot = _snapshot_prompt_cache(draft_cache)
+            if draft_snapshot is None:
+                rewind_failed = True
+                raise RuntimeError(
+                    "Speculative decoding cache rewind failed for draft cache. "
+                    "Disable speculative decoding or use a rewindable cache state."
+                )
+
+        if num_model_tokens > 0 and not _rewind_prompt_cache_from_snapshot(
+            model_cache, num_model_tokens, model_snapshot
+        ):
+            _restore_prompt_cache(model_snapshot)
+            _restore_prompt_cache(draft_snapshot)
+            rewind_failed = True
+            raise RuntimeError(
+                "Speculative decoding cache rewind failed for model cache. "
+                "Disable speculative decoding or use a rewindable cache state."
+            )
+
+        if num_draft_tokens_to_trim > 0 and not _rewind_prompt_cache_from_snapshot(
+            draft_cache, num_draft_tokens_to_trim, draft_snapshot
+        ):
+            _restore_prompt_cache(model_snapshot)
+            _restore_prompt_cache(draft_snapshot)
+            rewind_failed = True
+            raise RuntimeError(
+                "Speculative decoding cache rewind failed for draft cache. "
+                "Disable speculative decoding or use a rewindable cache state."
+            )
 
     def _draft_generate(y, num_draft):
         if num_draft == 0:
@@ -647,7 +979,12 @@ def speculative_generate_step(
                 prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
             _rewind_cache(num_draft, n)
     finally:
-        _rewind_cache(num_draft, n)
+        if not rewind_failed:
+            if sys.exc_info()[0] is None:
+                _rewind_cache(num_draft, n)
+            else:
+                with contextlib.suppress(Exception):
+                    _rewind_cache(num_draft, n)
 
 
 def stream_generate(
