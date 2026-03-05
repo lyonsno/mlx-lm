@@ -5,6 +5,7 @@ import argparse
 import mlx.core as mx
 
 from mlx_lm import batch_generate, load, stream_generate
+from mlx_lm.cli_utils import positive_int
 from mlx_lm.generate import DEFAULT_MODEL
 from mlx_lm.utils import pipeline_load, sharded_load
 
@@ -62,7 +63,7 @@ def setup_arg_parser():
     )
     parser.add_argument(
         "--prefill-step-size",
-        type=int,
+        type=positive_int,
         default=2048,
         help="Step size for prefill processing (default: 2048)",
     )

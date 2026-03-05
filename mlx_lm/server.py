@@ -34,6 +34,7 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
+from .cli_utils import positive_int
 from .generate import BatchGenerator, generation_stream, stream_generate
 from .models.cache import (
     CacheList,
@@ -287,24 +288,49 @@ class LRUPromptCache:
         )
 
     @staticmethod
+    def _can_rewind_rotating_cache(cache, num_to_trim):
+        if num_to_trim <= 0:
+            return True
+        if cache.keys is None or cache.values is None:
+            return False
+        if cache._idx < 0 or cache._idx > cache.keys.shape[2]:
+            return False
+        if num_to_trim > cache.offset or num_to_trim > cache._idx:
+            return False
+
+        if cache.offset > cache.keys.shape[2]:
+            # Chunked prefill with multi-token updates can legitimately produce
+            # offset > backing length while still retaining rewindable history.
+            has_chunked_concat_history = (
+                cache._idx == cache.keys.shape[2]
+                and cache.keys.shape[2] > cache.max_size
+            )
+            if not has_chunked_concat_history:
+                return False
+
+        new_offset = cache.offset - num_to_trim
+        new_idx = cache._idx - num_to_trim
+        if new_offset >= cache.max_size and new_idx < cache.max_size:
+            return False
+        return True
+
+    @staticmethod
     def _rewind_rotating_cache(cache, num_to_trim):
         """
         Rewind a rotating cache by ``num_to_trim`` tokens when enough history
         is still materialized in the backing arrays.
         """
-        if num_to_trim <= 0:
-            return True
-        if (
-            cache.keys is None
-            or cache.values is None
-            or num_to_trim > cache.offset
-            or num_to_trim > cache._idx
-        ):
+        if not LRUPromptCache._can_rewind_rotating_cache(cache, num_to_trim):
             return False
 
-        # Once decode-time in-place rotation starts, ``offset`` can exceed the
-        # backing storage length and older tokens are no longer recoverable.
-        if cache.offset > cache.keys.shape[2] or cache._idx > cache.keys.shape[2]:
+        if num_to_trim <= 0:
+            return True
+
+        # Reorder to temporal order before slicing so both concatenated and
+        # wrapped in-place states rewind from the newest tail consistently.
+        keys = cache._temporal_order(cache.keys)
+        values = cache._temporal_order(cache.values)
+        if num_to_trim > keys.shape[2]:
             return False
 
         cache.offset -= num_to_trim
@@ -312,12 +338,31 @@ class LRUPromptCache:
         if cache.offset < 0 or cache._idx < 0:
             return False
 
-        # Materialize the rewound prefix so subsequent single-token updates
-        # trim/rotate from the correct sequence prefix.
-        keys, values = cache.state
-        cache.state = (keys, values)
-        cache._idx = min(cache._idx, cache.keys.shape[2])
+        materialized = min(cache._idx, cache.offset)
+        cache.keys = keys[..., :materialized, :]
+        cache.values = values[..., :materialized, :]
+        cache._idx = materialized
         return True
+
+    def _can_rewind_layer_cache(self, layer_cache, num_to_trim):
+        if isinstance(layer_cache, CacheList):
+            return all(
+                self._can_rewind_layer_cache(child, num_to_trim)
+                for child in layer_cache.caches
+            )
+
+        if isinstance(layer_cache, RotatingKVCache):
+            return self._can_rewind_rotating_cache(layer_cache, num_to_trim)
+
+        # Avoid probing non-rotating layers on the stored cache object before
+        # deepcopy: custom is_trimmable() implementations may be impure.
+        return True
+
+    def _can_rewind_prompt_cache(self, cache, num_to_trim):
+        return all(
+            self._can_rewind_layer_cache(layer_cache, num_to_trim)
+            for layer_cache in cache
+        )
 
     def _rewind_layer_cache(self, layer_cache, num_to_trim):
         """
@@ -337,7 +382,8 @@ class LRUPromptCache:
         if isinstance(layer_cache, RotatingKVCache):
             return self._rewind_rotating_cache(layer_cache, num_to_trim)
 
-        if layer_cache.is_trimmable():
+        is_trimmable = getattr(layer_cache, "is_trimmable", None)
+        if callable(is_trimmable) and is_trimmable():
             # Fail closed if the layer cannot rewind by the full amount.
             return layer_cache.trim(num_to_trim) == num_to_trim
 
@@ -363,6 +409,9 @@ class LRUPromptCache:
             cache_entry = self._get(result.model, result.longer)
             prefix = min(len(tokens) - 1, result.common_prefix)
             num_to_trim = len(result.longer) - prefix
+
+            if not self._can_rewind_prompt_cache(cache_entry.prompt_cache, num_to_trim):
+                return None, tokens
 
             cache = copy.deepcopy(cache_entry.prompt_cache)
             if self._rewind_prompt_cache(cache, num_to_trim):
@@ -1860,7 +1909,7 @@ def run(
         response_generator.join()
 
 
-def main():
+def setup_arg_parser():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
         "--model",
@@ -1970,7 +2019,7 @@ def main():
     )
     parser.add_argument(
         "--prefill-step-size",
-        type=int,
+        type=positive_int,
         default=2048,
         help="Step size for prefill processing (default: 2048)",
     )
@@ -1990,6 +2039,11 @@ def main():
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    return parser
+
+
+def main():
+    parser = setup_arg_parser()
     args = parser.parse_args()
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
