@@ -1123,6 +1123,57 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(LegacyTrimLayer.trim_args, [expected_num_to_trim])
         self.assertEqual(reused_cache[0].offset, 1)
 
+    def test_legacy_partial_trim_fails_closed_and_preserves_exact_entry(self):
+        class LegacyPartialTrimLayer:
+            total_deepcopy_calls = 0
+            total_trim_calls = 0
+            trim_args = []
+
+            def __init__(self, offset=4):
+                self.offset = offset
+
+            @property
+            def nbytes(self):
+                return 1
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                type(self).total_trim_calls += 1
+                type(self).trim_args.append(n)
+                trimmed = max(0, n - 1)
+                self.offset = max(0, self.offset - trimmed)
+                return trimmed
+
+            def __deepcopy__(self, memo):
+                type(self).total_deepcopy_calls += 1
+                return type(self)(offset=self.offset)
+
+        LegacyPartialTrimLayer.total_deepcopy_calls = 0
+        LegacyPartialTrimLayer.total_trim_calls = 0
+        LegacyPartialTrimLayer.trim_args = []
+
+        lru = LRUPromptCache(max_size=10)
+        model = ("legacy-partial-trim", None, None)
+        long_tokens = [1, 2, 3, 4]
+        shorter_tokens = [1, 2]
+        expected_num_to_trim = len(long_tokens) - (len(shorter_tokens) - 1)
+
+        lru.insert_cache(model, long_tokens, [LegacyPartialTrimLayer()])
+        reused_cache, remaining = lru.fetch_nearest_cache(model, shorter_tokens)
+        self.assertIsNone(reused_cache)
+        self.assertEqual(remaining, shorter_tokens)
+        self.assertEqual(LegacyPartialTrimLayer.total_deepcopy_calls, 1)
+        self.assertEqual(LegacyPartialTrimLayer.total_trim_calls, 1)
+        self.assertEqual(LegacyPartialTrimLayer.trim_args, [expected_num_to_trim])
+
+        # Fail-closed miss should leave the exact longer entry unchanged.
+        exact_cache, exact_remaining = lru.fetch_nearest_cache(model, long_tokens)
+        self.assertIsNotNone(exact_cache)
+        self.assertEqual(exact_remaining, [])
+        self.assertEqual(exact_cache[0].offset, 4)
+
     def test_composite_partial_trim_safe_miss_keeps_exact_entry_available(self):
         class PartialTrimLeaf:
             total_rewind_calls = 0
