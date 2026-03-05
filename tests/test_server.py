@@ -6,12 +6,23 @@ import io
 import json
 import threading
 import unittest
+from queue import Queue
+from unittest.mock import patch
 
 import mlx.core as mx
 import requests
 
 from mlx_lm.models.cache import CacheList, KVCache, RotatingKVCache
-from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
+from mlx_lm.server import (
+    APIHandler,
+    CompletionRequest,
+    GenerationArguments,
+    LogitsProcessorArguments,
+    LRUPromptCache,
+    ModelDescription,
+    ResponseGenerator,
+    SamplingArguments,
+)
 from mlx_lm.utils import load
 
 
@@ -417,6 +428,149 @@ class TestKeepalive(unittest.TestCase):
             keepalive_callback(3072, 4096)
         except Exception as e:
             self.fail(f"Callback should handle BrokenPipeError: {e}")
+
+
+class TestResponseGeneratorPrefillStepSizeForwarding(unittest.TestCase):
+    @staticmethod
+    def _generation_args():
+        return GenerationArguments(
+            model=ModelDescription("default_model", None, None),
+            sampling=SamplingArguments(0.0, 1.0, 0, 0.0, 0.0, 0.0),
+            logits=LogitsProcessorArguments(None, 1.0, 20),
+            stop_words=[],
+            max_tokens=2,
+            num_draft_tokens=3,
+            logprobs=False,
+            top_logprobs=0,
+            seed=None,
+            chat_template_kwargs=None,
+        )
+
+    @staticmethod
+    def _make_text_request(prompt="hello"):
+        return CompletionRequest(
+            request_type="text",
+            prompt=prompt,
+            messages=[],
+            tools=None,
+            role_mapping=None,
+        )
+
+    def _build_response_generator(self, *, prefill_step_size):
+        class FakeModel:
+            def make_cache(self):
+                return [KVCache()]
+
+        class FakeTokenizer:
+            has_tool_calling = False
+            tool_call_start = ""
+            tool_call_end = ""
+            tool_parser = staticmethod(lambda text, _: {})
+            has_thinking = False
+            think_start_id = 0
+            think_end_id = 0
+            think_end = ""
+            eos_token_id = 0
+            eos_token_ids = set()
+
+            def encode(self, text, add_special_tokens=False):
+                return [1, 2, 3]
+
+        class FakeProvider:
+            is_batchable = True
+
+            def __init__(self):
+                self.cli_args = type(
+                    "obj",
+                    (object,),
+                    {
+                        "decode_concurrency": 4,
+                        "prompt_concurrency": 2,
+                        "prefill_step_size": prefill_step_size,
+                        "prompt_cache_bytes": None,
+                    },
+                )
+                self.model = FakeModel()
+                self.tokenizer = FakeTokenizer()
+                self.draft_model = None
+                self.model_key = ("fake-model", None, None)
+
+            def load(self, model, adapter=None, draft_model=None):
+                return self.model, self.tokenizer
+
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        generator.model_provider = FakeProvider()
+        generator.prompt_cache = LRUPromptCache(max_size=10)
+        generator.requests = Queue()
+        generator._is_distributed = False
+        generator._rank = 0
+        generator._stop = False
+        generator._time_budget = []
+        return generator
+
+    def test_serve_single_forwards_prefill_step_size(self):
+        expected_prefill_step_size = 77
+        generator = self._build_response_generator(
+            prefill_step_size=expected_prefill_step_size
+        )
+
+        gen_result = type(
+            "GenResult",
+            (),
+            {
+                "text": "x",
+                "token": 0,
+                "logprobs": mx.array([0.0], dtype=mx.float32),
+                "finish_reason": "stop",
+            },
+        )()
+
+        with patch(
+            "mlx_lm.server.stream_generate", return_value=iter([gen_result])
+        ) as stream_generate_mock:
+            generator._serve_single(
+                (Queue(), self._make_text_request(), self._generation_args())
+            )
+
+        self.assertEqual(stream_generate_mock.call_count, 1)
+        self.assertEqual(
+            stream_generate_mock.call_args.kwargs["prefill_step_size"],
+            expected_prefill_step_size,
+        )
+
+    def test_generate_batch_mode_forwards_prefill_step_size(self):
+        expected_prefill_step_size = 91
+        generator = self._build_response_generator(
+            prefill_step_size=expected_prefill_step_size
+        )
+        request_queue = Queue()
+        request_args = self._generation_args()
+        request = self._make_text_request()
+        request_seen = False
+
+        def next_request(timeout=None):
+            nonlocal request_seen
+            if request_seen:
+                return None
+            request_seen = True
+            return (request_queue, request, request_args)
+
+        generator._next_request = next_request
+
+        def fake_batch_generator(*args, **kwargs):
+            generator._stop = True
+            return object()
+
+        with patch(
+            "mlx_lm.server.BatchGenerator", side_effect=fake_batch_generator
+        ) as batch_generator_mock:
+            generator._generate()
+
+        self.assertEqual(batch_generator_mock.call_count, 1)
+        self.assertEqual(
+            batch_generator_mock.call_args.kwargs["prefill_step_size"],
+            expected_prefill_step_size,
+        )
 
 
 class TestLRUPromptCache(unittest.TestCase):
@@ -882,6 +1036,59 @@ class TestLRUPromptCache(unittest.TestCase):
         miss, rem3 = lru.fetch_nearest_cache(model, long_tokens)
         self.assertIsNone(miss)
         self.assertEqual(rem3, long_tokens)
+
+    def test_unknown_non_trimmable_layer_safe_miss_skips_deepcopy(self):
+        class UnknownNonTrimmableNoDeepcopy:
+            @property
+            def nbytes(self):
+                return 1
+
+            def is_trimmable(self):
+                return False
+
+            def __deepcopy__(self, memo):
+                raise AssertionError(
+                    "deepcopy should be skipped for unknown non-trimmable layers"
+                )
+
+        lru = LRUPromptCache(max_size=10)
+        model = ("unknown-no-deepcopy", None, None)
+        long_tokens = [1, 2, 3, 4]
+        shorter_tokens = [1, 2]
+
+        lru.insert_cache(model, long_tokens, [UnknownNonTrimmableNoDeepcopy()])
+        reused_cache, remaining = lru.fetch_nearest_cache(model, shorter_tokens)
+        self.assertIsNone(reused_cache)
+        self.assertEqual(remaining, shorter_tokens)
+
+        exact_cache, exact_remaining = lru.fetch_nearest_cache(model, long_tokens)
+        self.assertIsNotNone(exact_cache)
+        self.assertEqual(exact_remaining, [])
+
+    def test_unknown_layer_without_is_trimmable_fails_closed_without_deepcopy(self):
+        class UnknownLayerNoIsTrimmable:
+            @property
+            def nbytes(self):
+                return 1
+
+            def __deepcopy__(self, memo):
+                raise AssertionError(
+                    "deepcopy should be skipped when layer lacks is_trimmable"
+                )
+
+        lru = LRUPromptCache(max_size=10)
+        model = ("unknown-missing-is-trimmable", None, None)
+        long_tokens = [1, 2, 3, 4]
+        shorter_tokens = [1, 2]
+
+        lru.insert_cache(model, long_tokens, [UnknownLayerNoIsTrimmable()])
+        reused_cache, remaining = lru.fetch_nearest_cache(model, shorter_tokens)
+        self.assertIsNone(reused_cache)
+        self.assertEqual(remaining, shorter_tokens)
+
+        exact_cache, exact_remaining = lru.fetch_nearest_cache(model, long_tokens)
+        self.assertIsNotNone(exact_cache)
+        self.assertEqual(exact_remaining, [])
 
     def test_composite_partial_trim_safe_miss_keeps_exact_entry_available(self):
         class PartialTrimLeaf:

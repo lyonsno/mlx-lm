@@ -354,9 +354,13 @@ class LRUPromptCache:
         if isinstance(layer_cache, RotatingKVCache):
             return self._can_rewind_rotating_cache(layer_cache, num_to_trim)
 
-        # Avoid probing non-rotating layers on the stored cache object before
-        # deepcopy: custom is_trimmable() implementations may be impure.
-        return True
+        is_trimmable = getattr(layer_cache, "is_trimmable", None)
+        if not callable(is_trimmable):
+            return False
+        try:
+            return bool(is_trimmable())
+        except Exception:
+            return False
 
     def _can_rewind_prompt_cache(self, cache, num_to_trim):
         return all(
