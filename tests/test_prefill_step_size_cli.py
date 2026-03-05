@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import argparse
 import contextlib
 import io
 import sys
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 import mlx_lm.benchmark as benchmark_module
 from mlx_lm.benchmark import setup_arg_parser as setup_benchmark_arg_parser
+from mlx_lm.cli_utils import coerce_positive_int, positive_int
 from mlx_lm.server import setup_arg_parser as setup_server_arg_parser
 
 
@@ -136,6 +138,26 @@ class TestBenchmarkPrefillStepSizeForwarding(unittest.TestCase):
         self.assertGreaterEqual(batch_generate_mock.call_count, 2)
         for call in batch_generate_mock.call_args_list:
             self.assertEqual(call.kwargs["prefill_step_size"], 73)
+
+
+class TestPositiveIntValidation(unittest.TestCase):
+    def test_runtime_coerce_positive_int_accepts_only_positive_integers(self):
+        self.assertEqual(coerce_positive_int(1, field_name="prefill_step_size"), 1)
+        self.assertEqual(coerce_positive_int(64, field_name="prefill_step_size"), 64)
+
+    def test_runtime_coerce_positive_int_rejects_invalid_inputs(self):
+        for value in (0, -1, 1.5, True, "8", "1.5"):
+            with self.assertRaisesRegex(
+                ValueError, "prefill_step_size must be a positive integer"
+            ):
+                coerce_positive_int(value, field_name="prefill_step_size")
+
+    def test_argparse_positive_int_wrapper_parses_strings_and_rejects_bools(self):
+        self.assertEqual(positive_int("16"), 16)
+        with self.assertRaisesRegex(
+            argparse.ArgumentTypeError, "must be a positive integer"
+        ):
+            positive_int(True)
 
 
 if __name__ == "__main__":

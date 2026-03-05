@@ -4,7 +4,6 @@ import argparse
 import contextlib
 import functools
 import json
-import numbers
 import sys
 import time
 from dataclasses import dataclass
@@ -24,6 +23,7 @@ import mlx.nn as nn
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
+from .cli_utils import coerce_positive_int
 from .models import cache
 from .models.cache import (
     ArraysCache,
@@ -302,13 +302,7 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
 
 
 def _validate_prefill_step_size(prefill_step_size: int) -> int:
-    if (
-        not isinstance(prefill_step_size, numbers.Integral)
-        or isinstance(prefill_step_size, bool)
-        or prefill_step_size <= 0
-    ):
-        raise ValueError("prefill_step_size must be a positive integer")
-    return prefill_step_size
+    return coerce_positive_int(prefill_step_size, field_name="prefill_step_size")
 
 
 def generate_step(
