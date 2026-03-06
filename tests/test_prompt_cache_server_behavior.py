@@ -284,6 +284,40 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
         self.assertEqual(exact_remaining, [])
         self.assertEqual(exact_cache[0].offset, 4)
 
+    def test_can_rewind_only_layer_without_rewind_path_safe_miss_skips_deepcopy(self):
+        class CanRewindOnlyNoExecutionLayer:
+            def __init__(self):
+                self.offset = 4
+
+            @property
+            def nbytes(self):
+                return 1
+
+            def can_rewind(self, n):
+                return True
+
+            def __deepcopy__(self, memo):
+                raise AssertionError(
+                    "deepcopy should be skipped when can_rewind layer cannot execute rewind"
+                )
+
+        lru = LRUPromptCache(max_size=10)
+        model = ("can-rewind-only-no-execution", None, None)
+        long_tokens = [1, 2, 3, 4]
+        shorter_tokens = [1, 2]
+
+        layer = CanRewindOnlyNoExecutionLayer()
+        lru.insert_cache(model, long_tokens, [layer])
+
+        reused_cache, remaining = lru.fetch_nearest_cache(model, shorter_tokens)
+        self.assertIsNone(reused_cache)
+        self.assertEqual(remaining, shorter_tokens)
+
+        exact_cache, exact_remaining = lru.fetch_nearest_cache(model, long_tokens)
+        self.assertIsNotNone(exact_cache)
+        self.assertEqual(exact_remaining, [])
+        self.assertEqual(exact_cache[0].offset, 4)
+
     def test_legacy_offset_insufficient_safe_miss_skips_deepcopy(self):
         class LegacyOffsetLimitedLayer:
             def __init__(self):

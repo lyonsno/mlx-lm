@@ -487,13 +487,17 @@ def _snapshot_layer_cache(layer_cache):
     memo = {}
     stack = set()
     slots = {}
+    has_slots = False
     for slot in _iter_slots(layer_cache):
+        has_slots = True
         if hasattr(layer_cache, slot):
             snap_value = _snapshot_attr_value(getattr(layer_cache, slot), memo, stack)
             if snap_value is _UNSNAPSHOTABLE:
                 return None
-            slots[slot] = snap_value
-    if slots:
+            slots[slot] = (True, snap_value)
+        else:
+            slots[slot] = (False, None)
+    if has_slots:
         return ("slots", slots)
 
     return None
@@ -507,8 +511,23 @@ def _restore_layer_cache(layer_cache, snapshot):
         layer_cache.__dict__.clear()
         layer_cache.__dict__.update(state)
         return
-    for slot, value in state.items():
-        setattr(layer_cache, slot, value)
+    for slot, slot_snapshot in state.items():
+        if (
+            isinstance(slot_snapshot, tuple)
+            and len(slot_snapshot) == 2
+            and isinstance(slot_snapshot[0], bool)
+        ):
+            was_present, value = slot_snapshot
+        else:
+            # Backward compatibility for older in-memory snapshot payloads.
+            was_present, value = True, slot_snapshot
+        if was_present:
+            setattr(layer_cache, slot, value)
+        elif hasattr(layer_cache, slot):
+            try:
+                delattr(layer_cache, slot)
+            except Exception:
+                pass
 
 
 def _snapshot_prompt_cache(prompt_cache):
@@ -553,6 +572,55 @@ def _can_fast_rewind_layers(prompt_cache, num_to_trim):
     )
 
 
+def _classify_layer_rewindability(layer_cache, num_to_trim):
+    if num_to_trim <= 0:
+        return True, False, False
+
+    if isinstance(layer_cache, CacheList):
+        can_rewind = True
+        has_non_rotating_failure = False
+        has_rotating_failure = False
+        for child in layer_cache.caches:
+            child_can_rewind, child_non_rotating_failure, child_rotating_failure = (
+                _classify_layer_rewindability(child, num_to_trim)
+            )
+            can_rewind = can_rewind and child_can_rewind
+            has_non_rotating_failure = (
+                has_non_rotating_failure or child_non_rotating_failure
+            )
+            has_rotating_failure = has_rotating_failure or child_rotating_failure
+        return can_rewind, has_non_rotating_failure, has_rotating_failure
+
+    can_rewind = _can_rewind_layer_cache(layer_cache, num_to_trim)
+    if can_rewind:
+        return True, False, False
+    if isinstance(layer_cache, RotatingKVCache):
+        return False, False, True
+    return False, True, False
+
+
+def _classify_prompt_rewindability(prompt_cache, num_to_trim):
+    if num_to_trim <= 0:
+        return True, False, False
+
+    can_rewind = True
+    has_non_rotating_failure = False
+    has_rotating_failure = False
+    for layer_cache in prompt_cache:
+        (
+            layer_can_rewind,
+            layer_non_rotating_failure,
+            layer_rotating_failure,
+        ) = _classify_layer_rewindability(layer_cache, num_to_trim)
+        can_rewind = can_rewind and layer_can_rewind
+        has_non_rotating_failure = (
+            has_non_rotating_failure or layer_non_rotating_failure
+        )
+        has_rotating_failure = has_rotating_failure or layer_rotating_failure
+
+    return can_rewind, has_non_rotating_failure, has_rotating_failure
+
+
 def _contains_rotating_layer_cache(layer_cache):
     if isinstance(layer_cache, CacheList):
         return any(_contains_rotating_layer_cache(c) for c in layer_cache.caches)
@@ -563,6 +631,24 @@ def _contains_rotating_layers(prompt_cache):
     return any(
         _contains_rotating_layer_cache(layer_cache) for layer_cache in prompt_cache
     )
+
+
+def _iter_rotating_layer_caches(layer_cache):
+    if isinstance(layer_cache, CacheList):
+        for child in layer_cache.caches:
+            yield from _iter_rotating_layer_caches(child)
+        return
+    if isinstance(layer_cache, RotatingKVCache):
+        yield layer_cache
+
+
+def _min_rotating_max_size(prompt_cache):
+    max_sizes = [
+        layer_cache.max_size
+        for layer_cache in prompt_cache
+        for layer_cache in _iter_rotating_layer_caches(layer_cache)
+    ]
+    return min(max_sizes) if max_sizes else None
 
 
 def _rewind_layers_in_place(prompt_cache, num_to_trim):
@@ -921,7 +1007,7 @@ def speculative_generate_step(
         # Zero-trim rewinds are no-ops; avoid snapshot/preflight on unsnapshotable
         # caches when nothing needs to be rewound.
         if num_model_tokens <= 0 and num_draft_tokens_to_trim <= 0:
-            return
+            return True
 
         model_snapshot = None
         draft_snapshot = None
@@ -932,10 +1018,6 @@ def speculative_generate_step(
 
         if num_model_tokens > 0:
             if not _can_rewind_layers(model_cache, num_model_tokens):
-                if _contains_rotating_layers(model_cache):
-                    # Degrade gracefully on rotating/sliding rewind misses.
-                    rewind_failed = True
-                    return False
                 rewind_failed = True
                 raise RuntimeError(
                     "Speculative decoding cache rewind failed for model cache. "
@@ -945,10 +1027,6 @@ def speculative_generate_step(
 
         if num_draft_tokens_to_trim > 0:
             if not _can_rewind_layers(draft_cache, num_draft_tokens_to_trim):
-                if _contains_rotating_layers(draft_cache):
-                    # Degrade gracefully on rotating/sliding rewind misses.
-                    rewind_failed = True
-                    return False
                 rewind_failed = True
                 raise RuntimeError(
                     "Speculative decoding cache rewind failed for draft cache. "
@@ -1058,6 +1136,11 @@ def speculative_generate_step(
         draft_y = _prefill(draft_model, draft_cache, y)
         y = _prefill(model, model_cache, y)
 
+    combined_cache = [*model_cache, *draft_cache]
+    has_rotating_cache = _contains_rotating_layers(combined_cache)
+    min_rotating_max_size = _min_rotating_max_size(combined_cache)
+    initial_prompt_tokens = int(prompt.size)
+    rewind_precheck_ready = False
     ntoks = 0
     # Set these so the finally block doesn't raise
     num_draft = 0
@@ -1065,6 +1148,51 @@ def speculative_generate_step(
     try:
         while True:
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
+            if (
+                num_draft > 0
+                and has_rotating_cache
+                and not rewind_precheck_ready
+                and min_rotating_max_size is not None
+                and initial_prompt_tokens >= min_rotating_max_size
+                and num_draft > 1
+            ):
+                # The first speculative cycle can include full prompt processing,
+                # including chunked-prefill cases where y is only the tail. Rewind
+                # feasibility is not meaningful yet for rotating caches here when
+                # the cycle would require rotating draft rewind.
+                # Degrade to non-speculative decoding for this request.
+                num_draft = 0
+                num_draft_tokens = 0
+            elif num_draft > 0 and rewind_precheck_ready:
+                (
+                    model_can_rewind,
+                    model_non_rotating_failure,
+                    model_rotating_failure,
+                ) = _classify_prompt_rewindability(model_cache, num_draft)
+                (
+                    draft_can_rewind,
+                    draft_non_rotating_failure,
+                    draft_rotating_failure,
+                ) = _classify_prompt_rewindability(draft_cache, max(num_draft - 1, 0))
+
+                if not model_can_rewind or not draft_can_rewind:
+                    # Precheck runs on current cache state before this cycle appends
+                    # speculative tokens. Non-rotating misses can be false negatives
+                    # here, so let the post-step rewind validation decide. For
+                    # rotating-only misses, degrade before speculative work starts.
+                    has_non_rotating_failure = (
+                        model_non_rotating_failure or draft_non_rotating_failure
+                    )
+                    has_rotating_failure = (
+                        model_rotating_failure or draft_rotating_failure
+                    )
+                    if has_rotating_failure and not has_non_rotating_failure:
+                        # Rotating/sliding rewind misses are recoverable before
+                        # speculative work starts for this cycle. Fall back to
+                        # non-speculative decoding for the remaining tokens.
+                        num_draft = 0
+                        num_draft_tokens = 0
+
             draft_tokens = _draft_generate(draft_y, num_draft)
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
@@ -1103,10 +1231,8 @@ def speculative_generate_step(
 
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
-            if not _rewind_cache(num_draft, n):
-                # Rewind is unavailable for the current speculative cycle.
-                # Continue in non-speculative mode for the remainder.
-                num_draft_tokens = 0
+            _rewind_cache(num_draft, n)
+            rewind_precheck_ready = True
     finally:
         if not rewind_failed:
             if sys.exc_info()[0] is None:

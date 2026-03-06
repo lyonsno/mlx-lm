@@ -286,7 +286,15 @@ class LRUPromptCache:
 
     def _can_rewind_layer_cache(self, layer_cache, num_to_trim):
         can_rewind = getattr(layer_cache, "can_rewind", None)
+        rewind = getattr(layer_cache, "rewind", None)
+        is_trimmable = getattr(layer_cache, "is_trimmable", None)
+        trim = getattr(layer_cache, "trim", None)
         if callable(can_rewind):
+            has_execution_path = callable(rewind) or (
+                callable(is_trimmable) and callable(trim)
+            )
+            if not has_execution_path:
+                return False
             try:
                 return bool(can_rewind(num_to_trim))
             except Exception:
@@ -294,9 +302,6 @@ class LRUPromptCache:
 
         # Compatibility fallback for custom caches that only implement the
         # legacy is_trimmable()/trim()/rewind() contract.
-        is_trimmable = getattr(layer_cache, "is_trimmable", None)
-        trim = getattr(layer_cache, "trim", None)
-        rewind = getattr(layer_cache, "rewind", None)
         if not callable(is_trimmable) or (not callable(trim) and not callable(rewind)):
             return False
         try:
