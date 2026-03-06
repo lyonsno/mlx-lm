@@ -271,6 +271,30 @@ class TestKVBitsCoverage(unittest.TestCase):
         self.assertEqual(first.offset, 9)
         self.assertEqual(first.rewind_calls, [])
 
+    def test_can_rewind_prompt_cache_supports_can_rewind_plus_legacy_trim(self):
+        class CanRewindPlusTrimLayer:
+            def __init__(self, offset):
+                self.offset = offset
+                self.trim_calls = []
+
+            def can_rewind(self, n):
+                return n <= self.offset
+
+            def is_trimmable(self):
+                return True
+
+            def trim(self, n):
+                self.trim_calls.append(n)
+                trimmed = min(n, self.offset)
+                self.offset -= trimmed
+                return trimmed
+
+        layer = CanRewindPlusTrimLayer(offset=5)
+        self.assertTrue(can_rewind_prompt_cache([layer], 2))
+        self.assertTrue(rewind_prompt_cache([layer], 2))
+        self.assertEqual(layer.offset, 3)
+        self.assertEqual(layer.trim_calls, [2])
+
     def test_rewind_prompt_cache_rolls_back_nested_mutable_state(self):
         class NestedStateLayer:
             def __init__(self):
@@ -1526,6 +1550,69 @@ class TestKVBitsCoverage(unittest.TestCase):
                 max_tokens=3,
                 num_draft_tokens=2,
                 prefill_step_size=512,
+            )
+        )
+        self.assertEqual(len(outputs), 3)
+        self.assertTrue(all(not from_draft for _, _, from_draft in outputs))
+        self.assertEqual([int(token) for token, _, _ in outputs], baseline_tokens)
+
+    def test_speculative_generate_step_cached_rotating_hit_degrades_without_abort(
+        self,
+    ):
+        class OffsetTokenModel:
+            def __init__(self, shift):
+                self.shift = shift
+                self.layers = [object()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                if cache is not None:
+                    for layer_cache in cache:
+                        kv = mx.zeros(
+                            (1, 1, input_tokens.shape[1], 1), dtype=mx.float32
+                        )
+                        layer_cache.update_and_fetch(kv, kv)
+                    token_id = (int(cache[0].offset) + self.shift) % 7
+                else:
+                    token_id = self.shift % 7
+                batch, seq_len = input_tokens.shape
+                vocab_size = 7
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == token_id)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        def prefilled_rotating_cache():
+            cache = RotatingKVCache(max_size=8)
+            initial = mx.zeros((1, 1, 8, 1), dtype=mx.float32)
+            cache.update_and_fetch(initial, initial)
+            one = mx.zeros((1, 1, 1, 1), dtype=mx.float32)
+            cache.update_and_fetch(one, one)
+            cache.update_and_fetch(one, one)
+            return cache
+
+        prompt = mx.array([42], dtype=mx.uint32)
+
+        baseline_cache = prefilled_rotating_cache()
+        baseline_tokens = [
+            int(token)
+            for token, _ in generate_step(
+                prompt=prompt,
+                model=OffsetTokenModel(shift=0),
+                prompt_cache=[baseline_cache],
+                max_tokens=3,
+            )
+        ]
+
+        prompt_cache = [prefilled_rotating_cache(), prefilled_rotating_cache()]
+        outputs = list(
+            speculative_generate_step(
+                prompt=prompt,
+                model=OffsetTokenModel(shift=0),
+                draft_model=OffsetTokenModel(shift=1),
+                prompt_cache=prompt_cache,
+                max_tokens=3,
+                num_draft_tokens=2,
             )
         )
         self.assertEqual(len(outputs), 3)

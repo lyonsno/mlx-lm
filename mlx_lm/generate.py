@@ -331,9 +331,14 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
 
 def _can_rewind_layer_cache(layer_cache, num_to_trim):
     can_rewind = getattr(layer_cache, "can_rewind", None)
+    rewind = getattr(layer_cache, "rewind", None)
+    is_trimmable = getattr(layer_cache, "is_trimmable", None)
+    trim = getattr(layer_cache, "trim", None)
     if callable(can_rewind):
-        rewind = getattr(layer_cache, "rewind", None)
-        if not callable(rewind):
+        has_execution_path = callable(rewind) or (
+            callable(is_trimmable) and callable(trim)
+        )
+        if not has_execution_path:
             return False
         try:
             return bool(can_rewind(num_to_trim))
@@ -342,8 +347,6 @@ def _can_rewind_layer_cache(layer_cache, num_to_trim):
 
     # Compatibility fallback for custom caches that only implement the
     # legacy is_trimmable()/trim() contract.
-    is_trimmable = getattr(layer_cache, "is_trimmable", None)
-    trim = getattr(layer_cache, "trim", None)
     if not callable(is_trimmable) or not callable(trim):
         return False
     try:
@@ -649,6 +652,17 @@ def _min_rotating_max_size(prompt_cache):
         for layer_cache in _iter_rotating_layer_caches(layer_cache)
     ]
     return min(max_sizes) if max_sizes else None
+
+
+def _has_saturated_rotating_layers(prompt_cache):
+    for layer_cache in prompt_cache:
+        for rotating_cache in _iter_rotating_layer_caches(layer_cache):
+            try:
+                if rotating_cache.offset >= rotating_cache.max_size:
+                    return True
+            except Exception:
+                continue
+    return False
 
 
 def _rewind_layers_in_place(prompt_cache, num_to_trim):
@@ -1140,6 +1154,7 @@ def speculative_generate_step(
     has_rotating_cache = _contains_rotating_layers(combined_cache)
     min_rotating_max_size = _min_rotating_max_size(combined_cache)
     initial_prompt_tokens = int(prompt.size)
+    has_saturated_rotating_cache = _has_saturated_rotating_layers(combined_cache)
     rewind_precheck_ready = False
     ntoks = 0
     # Set these so the finally block doesn't raise
@@ -1152,14 +1167,21 @@ def speculative_generate_step(
                 num_draft > 0
                 and has_rotating_cache
                 and not rewind_precheck_ready
-                and min_rotating_max_size is not None
-                and initial_prompt_tokens >= min_rotating_max_size
+                and (
+                    has_saturated_rotating_cache
+                    or (
+                        min_rotating_max_size is not None
+                        and initial_prompt_tokens >= min_rotating_max_size
+                    )
+                )
                 and num_draft > 1
             ):
-                # The first speculative cycle can include full prompt processing,
-                # including chunked-prefill cases where y is only the tail. Rewind
-                # feasibility is not meaningful yet for rotating caches here when
-                # the cycle would require rotating draft rewind.
+                # Cache-hit and chunked-prefill flows can enter speculative decode
+                # with pre-saturated rotating state even when prompt is only the
+                # short remainder. Similarly, full-prompt first-cycle processing
+                # can cross rotating limits before rewind checks can run.
+                # Guard this first cycle when rotating draft rewind would be
+                # required.
                 # Degrade to non-speculative decoding for this request.
                 num_draft = 0
                 num_draft_tokens = 0
