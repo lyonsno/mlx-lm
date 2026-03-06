@@ -462,11 +462,17 @@ def _iter_slots(obj):
         if isinstance(slots, str):
             slots = (slots,)
         for slot in slots:
-            if slot != "__weakref__":
+            if slot not in {"__weakref__", "__dict__"}:
                 yield slot
 
 
 def _snapshot_layer_cache(layer_cache):
+    has_declared_slots = any(True for _ in _iter_slots(layer_cache))
+    if hasattr(layer_cache, "__dict__") and has_declared_slots:
+        # Hybrid `__dict__ + __slots__` objects are difficult to snapshot and
+        # restore atomically across custom cache types. Fail closed.
+        return None
+
     if hasattr(layer_cache, "__dict__"):
         memo = {}
         stack = set()
@@ -529,6 +535,60 @@ def _can_rewind_layers(prompt_cache, num_to_trim):
         _can_rewind_layer_cache(layer_cache, num_to_trim)
         for layer_cache in prompt_cache
     )
+
+
+def _is_known_fast_rewind_layer_cache(layer_cache):
+    if isinstance(layer_cache, CacheList):
+        return all(_is_known_fast_rewind_layer_cache(c) for c in layer_cache.caches)
+    return isinstance(layer_cache, (KVCache, QuantizedKVCache, RotatingKVCache))
+
+
+def _can_fast_rewind_layers(prompt_cache, num_to_trim):
+    if num_to_trim <= 0:
+        return True
+    return all(
+        _is_known_fast_rewind_layer_cache(layer_cache)
+        and _can_rewind_layer_cache(layer_cache, num_to_trim)
+        for layer_cache in prompt_cache
+    )
+
+
+def _contains_rotating_layer_cache(layer_cache):
+    if isinstance(layer_cache, CacheList):
+        return any(_contains_rotating_layer_cache(c) for c in layer_cache.caches)
+    return isinstance(layer_cache, RotatingKVCache)
+
+
+def _contains_rotating_layers(prompt_cache):
+    return any(
+        _contains_rotating_layer_cache(layer_cache) for layer_cache in prompt_cache
+    )
+
+
+def _rewind_layers_in_place(prompt_cache, num_to_trim):
+    if num_to_trim <= 0:
+        return True
+    return all(
+        _rewind_layer_cache(layer_cache, num_to_trim) for layer_cache in prompt_cache
+    )
+
+
+def _snapshot_known_fast_prompt_cache(prompt_cache):
+    snapshots = []
+    for layer_cache in prompt_cache:
+        try:
+            snapshots.append((layer_cache, layer_cache.state, layer_cache.meta_state))
+        except Exception:
+            return None
+    return snapshots
+
+
+def _restore_known_fast_prompt_cache(snapshots):
+    if snapshots is None:
+        return
+    for layer_cache, state, meta_state in snapshots:
+        layer_cache.state = state
+        layer_cache.meta_state = meta_state
 
 
 def _rewind_prompt_cache_from_snapshot(prompt_cache, num_to_trim, snapshots):
@@ -865,14 +925,72 @@ def speculative_generate_step(
 
         model_snapshot = None
         draft_snapshot = None
+        model_fast_path = False
+        draft_fast_path = False
+        model_fast_snapshot = None
+        draft_fast_snapshot = None
 
         if num_model_tokens > 0:
             if not _can_rewind_layers(model_cache, num_model_tokens):
+                if _contains_rotating_layers(model_cache):
+                    # Degrade gracefully on rotating/sliding rewind misses.
+                    rewind_failed = True
+                    return False
                 rewind_failed = True
                 raise RuntimeError(
                     "Speculative decoding cache rewind failed for model cache. "
                     "Disable speculative decoding or use a rewindable cache state."
                 )
+            model_fast_path = _can_fast_rewind_layers(model_cache, num_model_tokens)
+
+        if num_draft_tokens_to_trim > 0:
+            if not _can_rewind_layers(draft_cache, num_draft_tokens_to_trim):
+                if _contains_rotating_layers(draft_cache):
+                    # Degrade gracefully on rotating/sliding rewind misses.
+                    rewind_failed = True
+                    return False
+                rewind_failed = True
+                raise RuntimeError(
+                    "Speculative decoding cache rewind failed for draft cache. "
+                    "Disable speculative decoding or use a rewindable cache state."
+                )
+            draft_fast_path = _can_fast_rewind_layers(
+                draft_cache, num_draft_tokens_to_trim
+            )
+
+        # Only allow the snapshot-less fast-path when both rewinds are known-safe.
+        # If either side requires snapshot-based rollback, snapshot both so a
+        # failure restores caller-owned cache state atomically.
+        if (
+            num_model_tokens > 0
+            and num_draft_tokens_to_trim > 0
+            and (not model_fast_path or not draft_fast_path)
+        ):
+            model_fast_path = False
+            draft_fast_path = False
+
+        if num_model_tokens > 0 and model_fast_path:
+            model_fast_snapshot = _snapshot_known_fast_prompt_cache(model_cache)
+            if model_fast_snapshot is None:
+                model_fast_path = False
+
+        if num_draft_tokens_to_trim > 0 and draft_fast_path:
+            draft_fast_snapshot = _snapshot_known_fast_prompt_cache(draft_cache)
+            if draft_fast_snapshot is None:
+                draft_fast_path = False
+
+        # Keep model and draft rewind paths symmetric for atomic restore.
+        if (
+            num_model_tokens > 0
+            and num_draft_tokens_to_trim > 0
+            and (not model_fast_path or not draft_fast_path)
+        ):
+            model_fast_path = False
+            draft_fast_path = False
+            model_fast_snapshot = None
+            draft_fast_snapshot = None
+
+        if num_model_tokens > 0 and not model_fast_path:
             model_snapshot = _snapshot_prompt_cache(model_cache)
             if model_snapshot is None:
                 rewind_failed = True
@@ -881,13 +999,7 @@ def speculative_generate_step(
                     "Disable speculative decoding or use a rewindable cache state."
                 )
 
-        if num_draft_tokens_to_trim > 0:
-            if not _can_rewind_layers(draft_cache, num_draft_tokens_to_trim):
-                rewind_failed = True
-                raise RuntimeError(
-                    "Speculative decoding cache rewind failed for draft cache. "
-                    "Disable speculative decoding or use a rewindable cache state."
-                )
+        if num_draft_tokens_to_trim > 0 and not draft_fast_path:
             draft_snapshot = _snapshot_prompt_cache(draft_cache)
             if draft_snapshot is None:
                 rewind_failed = True
@@ -896,9 +1008,15 @@ def speculative_generate_step(
                     "Disable speculative decoding or use a rewindable cache state."
                 )
 
-        if num_model_tokens > 0 and not _rewind_prompt_cache_from_snapshot(
-            model_cache, num_model_tokens, model_snapshot
+        if num_model_tokens > 0 and not (
+            _rewind_layers_in_place(model_cache, num_model_tokens)
+            if model_fast_path
+            else _rewind_prompt_cache_from_snapshot(
+                model_cache, num_model_tokens, model_snapshot
+            )
         ):
+            _restore_known_fast_prompt_cache(model_fast_snapshot)
+            _restore_known_fast_prompt_cache(draft_fast_snapshot)
             _restore_prompt_cache(model_snapshot)
             _restore_prompt_cache(draft_snapshot)
             rewind_failed = True
@@ -907,9 +1025,15 @@ def speculative_generate_step(
                 "Disable speculative decoding or use a rewindable cache state."
             )
 
-        if num_draft_tokens_to_trim > 0 and not _rewind_prompt_cache_from_snapshot(
-            draft_cache, num_draft_tokens_to_trim, draft_snapshot
+        if num_draft_tokens_to_trim > 0 and not (
+            _rewind_layers_in_place(draft_cache, num_draft_tokens_to_trim)
+            if draft_fast_path
+            else _rewind_prompt_cache_from_snapshot(
+                draft_cache, num_draft_tokens_to_trim, draft_snapshot
+            )
         ):
+            _restore_known_fast_prompt_cache(model_fast_snapshot)
+            _restore_known_fast_prompt_cache(draft_fast_snapshot)
             _restore_prompt_cache(model_snapshot)
             _restore_prompt_cache(draft_snapshot)
             rewind_failed = True
@@ -917,6 +1041,8 @@ def speculative_generate_step(
                 "Speculative decoding cache rewind failed for draft cache. "
                 "Disable speculative decoding or use a rewindable cache state."
             )
+
+        return True
 
     def _draft_generate(y, num_draft):
         if num_draft == 0:
@@ -977,7 +1103,10 @@ def speculative_generate_step(
 
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
-            _rewind_cache(num_draft, n)
+            if not _rewind_cache(num_draft, n):
+                # Rewind is unavailable for the current speculative cycle.
+                # Continue in non-speculative mode for the remainder.
+                num_draft_tokens = 0
     finally:
         if not rewind_failed:
             if sys.exc_info()[0] is None:

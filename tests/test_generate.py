@@ -22,6 +22,7 @@ from mlx_lm.generate import (
     stream_generate,
 )
 from mlx_lm.models.cache import (
+    CacheList,
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
@@ -343,6 +344,56 @@ class TestKVBitsCoverage(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual(layer.offset, 10)
 
+    def test_rewind_prompt_cache_hybrid_slots_and_dict_state_fails_closed(self):
+        class HybridStateLayer:
+            __slots__ = ("offset", "slot_state", "__dict__")
+
+            def __init__(self):
+                self.offset = 10
+                self.slot_state = {"value": 7}
+                self.dict_state = [5]
+
+            def can_rewind(self, n):
+                return True
+
+            def rewind(self, n):
+                self.offset -= n
+                self.slot_state["value"] -= n
+                self.dict_state[0] -= n
+                return False
+
+        layer = HybridStateLayer()
+        self.assertFalse(can_rewind_prompt_cache([layer], 1))
+        self.assertFalse(rewind_prompt_cache([layer], 1))
+        self.assertEqual(layer.offset, 10)
+        self.assertEqual(layer.slot_state, {"value": 7})
+        self.assertEqual(layer.dict_state, [5])
+
+    def test_rewind_prompt_cache_hybrid_slots_declared_but_unset_fails_closed(self):
+        class HybridUnsetSlotLayer:
+            __slots__ = ("offset", "slot_state", "__dict__")
+
+            def __init__(self):
+                self.offset = 10
+                self.dict_state = [5]
+
+            def can_rewind(self, n):
+                return True
+
+            def rewind(self, n):
+                self.offset -= n
+                self.slot_state = {"value": 7}
+                self.dict_state[0] -= n
+                return False
+
+        layer = HybridUnsetSlotLayer()
+        self.assertFalse(hasattr(layer, "slot_state"))
+        self.assertFalse(can_rewind_prompt_cache([layer], 1))
+        self.assertFalse(rewind_prompt_cache([layer], 1))
+        self.assertEqual(layer.offset, 10)
+        self.assertEqual(layer.dict_state, [5])
+        self.assertFalse(hasattr(layer, "slot_state"))
+
     def test_generate_step_quantizes_eligible_cache_layer(self):
         class QuantizedCache:
             def __init__(self, bits, group_size):
@@ -389,13 +440,14 @@ class TestKVBitsCoverage(unittest.TestCase):
         self.assertEqual(prompt_cache[0].group_size, 16)
 
     def test_speculative_generate_step_raises_on_rewind_failure(self):
-        class NonRewindCache:
+        class FlakyRewindCache:
             offset = 8
 
-            def is_trimmable(self):
-                return False
+            def can_rewind(self, n):
+                return True
 
             def rewind(self, n):
+                self.offset -= n
                 return False
 
         class FixedTokenModel:
@@ -405,7 +457,7 @@ class TestKVBitsCoverage(unittest.TestCase):
                 self.forced_token = forced_token
 
             def make_cache(self):
-                return [NonRewindCache()]
+                return [FlakyRewindCache()]
 
             def __call__(self, input_tokens, cache=None, input_embeddings=None):
                 batch, seq_len = input_tokens.shape
@@ -782,13 +834,14 @@ class TestKVBitsCoverage(unittest.TestCase):
     def test_speculative_generate_step_surfaces_cleanup_rewind_failure_on_success_path(
         self,
     ):
-        class NonRewindCache:
+        class FlakyRewindCache:
             offset = 8
 
             def can_rewind(self, n):
-                return False
+                return True
 
             def rewind(self, n):
+                self.offset -= n
                 return False
 
         class FixedTokenModel:
@@ -811,7 +864,7 @@ class TestKVBitsCoverage(unittest.TestCase):
             prompt=prompt,
             model=FixedTokenModel(forced_token=0),
             draft_model=FixedTokenModel(forced_token=1),
-            prompt_cache=[NonRewindCache(), NonRewindCache()],
+            prompt_cache=[FlakyRewindCache(), FlakyRewindCache()],
             max_tokens=1,
             num_draft_tokens=1,
         )
@@ -1042,6 +1095,434 @@ class TestKVBitsCoverage(unittest.TestCase):
 
         self.assertEqual(CountedBox.copies, 1)
 
+    def test_speculative_generate_step_known_cache_fast_path_skips_snapshotting(self):
+        class CacheUpdatingFixedTokenModel:
+            def __init__(self, forced_token):
+                self.forced_token = forced_token
+                self.layers = [object()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                if cache is not None:
+                    for layer_cache in cache:
+                        kv = mx.zeros(
+                            (1, 1, input_tokens.shape[1], 1), dtype=mx.float32
+                        )
+                        layer_cache.update_and_fetch(kv, kv)
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == self.forced_token)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+        model_cache = KVCache()
+        draft_cache = KVCache()
+        prompt_cache = [model_cache, draft_cache]
+        rewind_calls = {id(model_cache): [], id(draft_cache): []}
+        original_kv_rewind = KVCache.rewind
+
+        def tracking_kv_rewind(cache_obj, num_to_trim):
+            if id(cache_obj) in rewind_calls:
+                rewind_calls[id(cache_obj)].append(num_to_trim)
+            return original_kv_rewind(cache_obj, num_to_trim)
+
+        # Known in-tree cache types should be able to rewind without going through
+        # generic snapshot materialization.
+        with patch.object(
+            generate_module,
+            "_snapshot_prompt_cache",
+            side_effect=AssertionError(
+                "_snapshot_prompt_cache should not run for known cache fast-path"
+            ),
+        ), patch.object(KVCache, "rewind", tracking_kv_rewind):
+            outputs = []
+            for token, _logprobs, from_draft in speculative_generate_step(
+                prompt=prompt,
+                model=CacheUpdatingFixedTokenModel(forced_token=0),
+                draft_model=CacheUpdatingFixedTokenModel(forced_token=1),
+                prompt_cache=prompt_cache,
+                max_tokens=2,
+                num_draft_tokens=2,
+            ):
+                outputs.append(
+                    (
+                        int(token),
+                        bool(from_draft),
+                        model_cache.offset,
+                        draft_cache.offset,
+                    )
+                )
+
+        self.assertEqual(len(outputs), 2)
+        self.assertTrue(all(not from_draft for _, from_draft, _, _ in outputs))
+        self.assertEqual(rewind_calls[id(model_cache)], [2, 1])
+        self.assertEqual(rewind_calls[id(draft_cache)], [1])
+        self.assertLess(model_cache.offset, max(o[2] for o in outputs))
+        self.assertEqual(model_cache.offset, draft_cache.offset)
+
+    def test_speculative_generate_step_known_mixed_rotating_fast_path_skips_snapshotting(
+        self,
+    ):
+        class CacheUpdatingFixedTokenModel:
+            def __init__(self, forced_token):
+                self.forced_token = forced_token
+                self.layers = [object(), object()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                if cache is not None:
+                    for layer_cache in cache:
+                        kv = mx.zeros(
+                            (1, 1, input_tokens.shape[1], 1), dtype=mx.float32
+                        )
+                        layer_cache.update_and_fetch(kv, kv)
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == self.forced_token)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+        prompt_cache = [
+            KVCache(),
+            RotatingKVCache(max_size=64),
+            KVCache(),
+            RotatingKVCache(max_size=64),
+        ]
+        model_kv, model_rot, draft_kv, draft_rot = prompt_cache
+        kv_rewind_calls = {id(model_kv): [], id(draft_kv): []}
+        rot_rewind_calls = {id(model_rot): [], id(draft_rot): []}
+        original_kv_rewind = KVCache.rewind
+        original_rot_rewind = RotatingKVCache.rewind
+
+        def tracking_kv_rewind(cache_obj, num_to_trim):
+            if id(cache_obj) in kv_rewind_calls:
+                kv_rewind_calls[id(cache_obj)].append(num_to_trim)
+            return original_kv_rewind(cache_obj, num_to_trim)
+
+        def tracking_rot_rewind(cache_obj, num_to_trim):
+            if id(cache_obj) in rot_rewind_calls:
+                rot_rewind_calls[id(cache_obj)].append(num_to_trim)
+            return original_rot_rewind(cache_obj, num_to_trim)
+
+        with patch.object(
+            generate_module,
+            "_snapshot_prompt_cache",
+            side_effect=AssertionError(
+                "_snapshot_prompt_cache should not run for known mixed fast-path"
+            ),
+        ), patch.object(KVCache, "rewind", tracking_kv_rewind), patch.object(
+            RotatingKVCache, "rewind", tracking_rot_rewind
+        ):
+            outputs = list(
+                speculative_generate_step(
+                    prompt=prompt,
+                    model=CacheUpdatingFixedTokenModel(forced_token=0),
+                    draft_model=CacheUpdatingFixedTokenModel(forced_token=1),
+                    prompt_cache=prompt_cache,
+                    max_tokens=2,
+                    num_draft_tokens=2,
+                )
+            )
+
+        self.assertEqual(len(outputs), 2)
+        self.assertTrue(all(not from_draft for _, _, from_draft in outputs))
+        self.assertEqual(kv_rewind_calls[id(model_kv)], [2, 1])
+        self.assertEqual(rot_rewind_calls[id(model_rot)], [2, 1])
+        self.assertEqual(kv_rewind_calls[id(draft_kv)], [1])
+        self.assertEqual(rot_rewind_calls[id(draft_rot)], [1])
+        self.assertEqual([layer.offset for layer in prompt_cache], [4, 4, 4, 4])
+
+    def test_speculative_generate_step_rotating_rewind_miss_degrades_without_crashing(
+        self,
+    ):
+        class CacheUpdatingFixedTokenModel:
+            def __init__(self, forced_token):
+                self.forced_token = forced_token
+                self.layers = [object()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                if cache is not None:
+                    for layer_cache in cache:
+                        kv = mx.zeros(
+                            (1, 1, input_tokens.shape[1], 1), dtype=mx.float32
+                        )
+                        layer_cache.update_and_fetch(kv, kv)
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == self.forced_token)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        prompt = mx.array(list(range(1, 12)), dtype=mx.uint32)
+        model_cache = RotatingKVCache(max_size=8)
+        draft_cache = RotatingKVCache(max_size=8)
+        outputs = list(
+            speculative_generate_step(
+                prompt=prompt,
+                model=CacheUpdatingFixedTokenModel(forced_token=0),
+                draft_model=CacheUpdatingFixedTokenModel(forced_token=1),
+                prompt_cache=[model_cache, draft_cache],
+                max_tokens=3,
+                num_draft_tokens=2,
+            )
+        )
+
+        # Rewind miss should gracefully fall back instead of aborting generation.
+        self.assertEqual(len(outputs), 3)
+        self.assertTrue(all(not from_draft for _, _, from_draft in outputs))
+
+    def test_speculative_generate_step_known_fast_path_failure_rolls_back_atomically(
+        self,
+    ):
+        class CacheUpdatingFixedTokenModel:
+            def __init__(self, forced_token):
+                self.forced_token = forced_token
+                self.layers = [object()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                if cache is not None:
+                    for layer_cache in cache:
+                        kv = mx.zeros(
+                            (1, 1, input_tokens.shape[1], 1), dtype=mx.float32
+                        )
+                        layer_cache.update_and_fetch(kv, kv)
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == self.forced_token)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+        model_cache = KVCache()
+        draft_cache = KVCache()
+        prompt_cache = [model_cache, draft_cache]
+        original_kv_rewind = KVCache.rewind
+
+        def fail_draft_rewind(cache_obj, num_to_trim):
+            if cache_obj is draft_cache:
+                # Simulate a buggy rewind implementation that mutates before fail.
+                cache_obj.offset -= num_to_trim
+                return False
+            return original_kv_rewind(cache_obj, num_to_trim)
+
+        gen = speculative_generate_step(
+            prompt=prompt,
+            model=CacheUpdatingFixedTokenModel(forced_token=0),
+            draft_model=CacheUpdatingFixedTokenModel(forced_token=1),
+            prompt_cache=prompt_cache,
+            max_tokens=2,
+            num_draft_tokens=2,
+        )
+        with patch.object(KVCache, "rewind", fail_draft_rewind):
+            next(gen)
+            offsets_before_failure = (model_cache.offset, draft_cache.offset)
+            with self.assertRaisesRegex(
+                RuntimeError, "Speculative decoding cache rewind failed for draft cache"
+            ):
+                next(gen)
+
+        self.assertEqual(
+            (model_cache.offset, draft_cache.offset), offsets_before_failure
+        )
+
+    def test_known_fast_rewind_handles_quantized_and_nested_cachelist(self):
+        kv_shape = (1, 1, 3, 32)
+
+        kv = KVCache()
+        kv.update_and_fetch(
+            mx.zeros(kv_shape, dtype=mx.float32),
+            mx.zeros(kv_shape, dtype=mx.float32),
+        )
+
+        rotating = RotatingKVCache(max_size=16)
+        rotating.update_and_fetch(
+            mx.zeros(kv_shape, dtype=mx.float32),
+            mx.zeros(kv_shape, dtype=mx.float32),
+        )
+
+        quantized = QuantizedKVCache(bits=4, group_size=32)
+        quantized.update_and_fetch(
+            mx.zeros(kv_shape, dtype=mx.float32),
+            mx.zeros(kv_shape, dtype=mx.float32),
+        )
+
+        nested_known = CacheList(CacheList(kv, rotating), quantized)
+        self.assertTrue(generate_module._can_fast_rewind_layers([nested_known], 1))
+
+        class UnknownLayer:
+            offset = 3
+
+            def can_rewind(self, n):
+                return True
+
+            def rewind(self, n):
+                return True
+
+        nested_mixed = CacheList(CacheList(KVCache(), UnknownLayer()), quantized)
+        self.assertFalse(generate_module._can_fast_rewind_layers([nested_mixed], 1))
+
+    def test_speculative_generate_step_custom_cache_path_still_uses_snapshot(self):
+        class CustomRewindLayer:
+            def __init__(self, offset, *, fail_rewind=False):
+                self.offset = offset
+                self.fail_rewind = fail_rewind
+                self.rewind_calls = []
+
+            def can_rewind(self, n):
+                return n <= self.offset
+
+            def rewind(self, n):
+                self.rewind_calls.append(n)
+                self.offset -= n
+                return not self.fail_rewind
+
+        class CacheUpdatingFixedTokenModel:
+            def __init__(self, forced_token):
+                self.forced_token = forced_token
+                self.layers = [object()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                if cache is not None:
+                    for layer_cache in cache:
+                        layer_cache.offset += input_tokens.shape[1]
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == self.forced_token)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+        model_layer = CustomRewindLayer(offset=20)
+        draft_layer = CustomRewindLayer(offset=20, fail_rewind=True)
+        prompt_cache = [model_layer, draft_layer]
+        snapshot_calls = []
+        original_snapshot = generate_module._snapshot_prompt_cache
+
+        def tracking_snapshot(cache_layers):
+            snapshot_calls.append(len(cache_layers))
+            return original_snapshot(cache_layers)
+
+        with patch.object(
+            generate_module,
+            "_snapshot_prompt_cache",
+            side_effect=tracking_snapshot,
+        ):
+            gen = speculative_generate_step(
+                prompt=prompt,
+                model=CacheUpdatingFixedTokenModel(forced_token=0),
+                draft_model=CacheUpdatingFixedTokenModel(forced_token=1),
+                prompt_cache=prompt_cache,
+                max_tokens=2,
+                num_draft_tokens=2,
+            )
+            next(gen)
+            offsets_before_failure = [layer.offset for layer in prompt_cache]
+            with self.assertRaisesRegex(
+                RuntimeError, "Speculative decoding cache rewind failed for draft cache"
+            ):
+                next(gen)
+
+        self.assertGreaterEqual(len(snapshot_calls), 2)
+        self.assertEqual(snapshot_calls[0], 1)
+        self.assertEqual(snapshot_calls[1], 1)
+        self.assertEqual(
+            [layer.offset for layer in prompt_cache], offsets_before_failure
+        )
+
+    def test_speculative_generate_step_mixed_known_custom_failure_is_atomic(self):
+        class CustomRewindLayer:
+            def __init__(self, offset, *, fail_rewind=False, call_log=None):
+                self.offset = offset
+                self.fail_rewind = fail_rewind
+                self.call_log = call_log
+
+            def can_rewind(self, n):
+                return n <= self.offset
+
+            def rewind(self, n):
+                if self.call_log is not None:
+                    self.call_log.append(n)
+                self.offset -= n
+                return not self.fail_rewind
+
+        class CacheUpdatingFixedTokenModel:
+            def __init__(self, forced_token):
+                self.forced_token = forced_token
+                self.layers = [object(), object()]
+
+            def __call__(self, input_tokens, cache=None, input_embeddings=None):
+                if cache is not None:
+                    for layer_cache in cache:
+                        if isinstance(layer_cache, KVCache):
+                            kv = mx.zeros(
+                                (1, 1, input_tokens.shape[1], 1), dtype=mx.float32
+                            )
+                            layer_cache.update_and_fetch(kv, kv)
+                        else:
+                            layer_cache.offset += input_tokens.shape[1]
+                batch, seq_len = input_tokens.shape
+                vocab_size = 4
+                token_logits = -1000.0 * mx.ones((vocab_size,), dtype=mx.float32)
+                token_logits = token_logits + (
+                    2000.0 * (mx.arange(vocab_size) == self.forced_token)
+                )
+                return mx.broadcast_to(token_logits, (batch, seq_len, vocab_size))
+
+        prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+        model_known = KVCache()
+        model_custom_calls = []
+        draft_custom_fail_calls = []
+        model_custom = CustomRewindLayer(offset=20, call_log=model_custom_calls)
+        draft_known = KVCache()
+        draft_custom_fail = CustomRewindLayer(
+            offset=20, fail_rewind=True, call_log=draft_custom_fail_calls
+        )
+        prompt_cache = [model_known, model_custom, draft_known, draft_custom_fail]
+        known_rewind_calls = {id(model_known): [], id(draft_known): []}
+        original_kv_rewind = KVCache.rewind
+
+        def tracking_kv_rewind(cache_obj, num_to_trim):
+            if id(cache_obj) in known_rewind_calls:
+                known_rewind_calls[id(cache_obj)].append(num_to_trim)
+            return original_kv_rewind(cache_obj, num_to_trim)
+
+        with patch.object(KVCache, "rewind", tracking_kv_rewind):
+            gen = speculative_generate_step(
+                prompt=prompt,
+                model=CacheUpdatingFixedTokenModel(forced_token=0),
+                draft_model=CacheUpdatingFixedTokenModel(forced_token=1),
+                prompt_cache=prompt_cache,
+                max_tokens=2,
+                num_draft_tokens=2,
+            )
+            next(gen)
+            offsets_before_failure = [
+                cache_layer.offset for cache_layer in prompt_cache
+            ]
+            with self.assertRaisesRegex(
+                RuntimeError, "Speculative decoding cache rewind failed for draft cache"
+            ):
+                next(gen)
+
+        self.assertGreater(len(known_rewind_calls[id(model_known)]), 0)
+        self.assertGreater(len(known_rewind_calls[id(draft_known)]), 0)
+        self.assertEqual(model_custom_calls, [2])
+        self.assertEqual(draft_custom_fail_calls, [1])
+        self.assertEqual(
+            [cache_layer.offset for cache_layer in prompt_cache],
+            offsets_before_failure,
+        )
+
     def test_generate_main_raises_for_prompt_cache_kv_bits_mismatch(self):
         with patch.object(
             sys,
@@ -1192,8 +1673,11 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(len(results), 5)
         # since num_draft_tokens is 2 and draft model is the same, the
         # first 2 generations should be drafts, the third should come
-        # from the target model, and last two should be drafts
-        self.assertEqual(drafted, [True, True, False, True, True])
+        # from the target model. The final two tokens may remain speculative
+        # or fall back to target-model tokens if speculative rewind becomes
+        # unavailable for the model/cache combination.
+        self.assertEqual(drafted[:3], [True, True, False])
+        self.assertIn(drafted[3:], ([True, True], [False, False]))
 
     def test_stream_generate_input_embeddings(self):
         sampler = make_sampler(temp=0.0)  # determinate sampler
