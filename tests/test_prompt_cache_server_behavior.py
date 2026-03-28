@@ -56,7 +56,6 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
         self.assertTrue((k == v).all().item())
         self.assertTrue((k.flatten() == mx.arange(24)).all().item())
         self.assertEqual(t, [20] * 5)
-        self.assertEqual(len(cache._lru), 0)
 
         tokens = tokens + [30] * 3
         c[0].update_and_fetch(*get_kv(8))
@@ -70,7 +69,13 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
             (k.flatten() == mx.concatenate([mx.arange(24), mx.arange(2)])).all().item()
         )
         self.assertEqual(t, [40] * 8)
-        self.assertEqual(len(cache._lru), 1)
+
+        # The 32-token entry should still be reusable after the prefix-match
+        # extraction (rewind operates on a copy, not the original).
+        full_tokens = [10] * 24 + [20] * 5 + [30] * 3
+        c2, t2 = cache.fetch_nearest_cache(model, full_tokens)
+        self.assertIsNotNone(c2)
+        self.assertEqual(t2, [])
 
     def test_lru(self):
         cache = LRUPromptCache(max_size=2)
@@ -384,6 +389,79 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
         self.assertEqual(exact_remaining, [])
         self.assertEqual(exact_cache[0][0].offset, 4)
         self.assertEqual(exact_cache[0][1].offset, 4)
+
+    def test_cachelist_partial_child_failure_is_safe_miss(self):
+        scenarios = [
+            (
+                "first_child_partial",
+                lambda: CacheList(
+                    RewindRecorderLayer(max_rewind=10, rewind_result=False),
+                    RewindRecorderLayer(max_rewind=10, rewind_result=True),
+                ),
+            ),
+            (
+                "nested_partial",
+                lambda: CacheList(
+                    CacheList(
+                        RewindRecorderLayer(max_rewind=10, rewind_result=False),
+                        RewindRecorderLayer(max_rewind=10, rewind_result=True),
+                    ),
+                    RewindRecorderLayer(max_rewind=10, rewind_result=True),
+                ),
+            ),
+            (
+                "second_child_partial",
+                lambda: CacheList(
+                    RewindRecorderLayer(max_rewind=10, rewind_result=True),
+                    RewindRecorderLayer(max_rewind=10, rewind_result=False),
+                ),
+            ),
+        ]
+
+        long_tokens = list(range(1, 11))
+        shorter_tokens = long_tokens[:5]
+
+        for name, builder in scenarios:
+            with self.subTest(name=name):
+                lru = LRUPromptCache(max_size=10)
+                model = (f"cachelist-partial-{name}", None, None)
+                composite = builder()
+                lru.insert_cache(model, long_tokens, [composite])
+
+                reused, remaining = lru.fetch_nearest_cache(model, shorter_tokens)
+                self.assertIsNone(reused)
+                self.assertEqual(remaining, shorter_tokens)
+
+                exact, exact_rem = lru.fetch_nearest_cache(model, long_tokens)
+                self.assertIsNotNone(exact)
+                self.assertEqual(exact_rem, [])
+
+    def test_broken_rotating_cache_fails_closed_even_when_trimmable(self):
+        cache = RotatingKVCache(max_size=8)
+        kv = mx.arange(4, dtype=mx.float32).reshape(1, 1, 4, 1)
+        cache.update_and_fetch(kv, kv)
+        mx.eval(cache.keys, cache.values)
+
+        self.assertTrue(cache.is_trimmable())
+
+        lru = LRUPromptCache(max_size=10)
+        model = ("broken-rotating-guard", None, None)
+        long_tokens = [1, 2, 3, 4]
+        shorter_tokens = [1, 2]
+
+        lru.insert_cache(model, long_tokens, [cache])
+
+        # Corrupt the cache after insertion to simulate a broken state
+        # that is_trimmable() still reports as trimmable.
+        cache.values = None
+
+        reused, remaining = lru.fetch_nearest_cache(model, shorter_tokens)
+        self.assertIsNone(reused)
+        self.assertEqual(remaining, shorter_tokens)
+
+        exact, exact_rem = lru.fetch_nearest_cache(model, long_tokens)
+        self.assertIsNotNone(exact)
+        self.assertEqual(exact_rem, [])
 
     def test_mixed_cache_longer_prefix_reuse_when_rotating_cache_is_full(self):
         lru = LRUPromptCache(max_size=10)

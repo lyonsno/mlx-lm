@@ -64,6 +64,14 @@ def snapshot_cache_arrays(cache):
 
 
 class RewindRecorderLayer:
+    """Dual-mode mock that satisfies both the cache-owned rewind API
+    (can_rewind/rewind) and the legacy server-introspection contract
+    (is_trimmable/trim). The server prefers can_rewind when present;
+    upstream servers that only know the legacy path will use
+    is_trimmable/trim instead. Both paths record to the same call lists
+    and mutate offset identically, so behavioral assertions work
+    regardless of which path the system under test takes."""
+
     def __init__(
         self,
         *,
@@ -72,16 +80,20 @@ class RewindRecorderLayer:
         offset=None,
         rewind_calls=None,
         can_rewind_calls=None,
+        trim_calls=None,
     ):
         self.max_rewind = max_rewind
         self.rewind_result = rewind_result
         self.rewind_calls = rewind_calls if rewind_calls is not None else []
         self.can_rewind_calls = can_rewind_calls if can_rewind_calls is not None else []
+        self.trim_calls = trim_calls if trim_calls is not None else []
         self.offset = max_rewind if offset is None else offset
 
     @property
     def nbytes(self):
         return 1
+
+    # -- Modern cache-owned API --
 
     def can_rewind(self, n):
         self.can_rewind_calls.append(n)
@@ -93,6 +105,19 @@ class RewindRecorderLayer:
             self.offset = max(0, self.offset - n)
         return self.rewind_result
 
+    # -- Legacy server-introspection API --
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        self.trim_calls.append(n)
+        if not self.rewind_result:
+            return 0
+        trimmed = min(n, self.offset)
+        self.offset = max(0, self.offset - trimmed)
+        return trimmed
+
     def __deepcopy__(self, memo):
         return type(self)(
             max_rewind=self.max_rewind,
@@ -100,6 +125,7 @@ class RewindRecorderLayer:
             offset=self.offset,
             rewind_calls=self.rewind_calls,
             can_rewind_calls=self.can_rewind_calls,
+            trim_calls=self.trim_calls,
         )
 
 
@@ -178,6 +204,12 @@ class DeepcopyShouldNotRunLayer:
 
     def rewind(self, n):
         return True
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        return n
 
     def __deepcopy__(self, memo):
         raise AssertionError("deepcopy should be skipped on known-safe miss")
