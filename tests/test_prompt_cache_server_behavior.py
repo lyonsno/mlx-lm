@@ -56,7 +56,6 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
         self.assertTrue((k == v).all().item())
         self.assertTrue((k.flatten() == mx.arange(24)).all().item())
         self.assertEqual(t, [20] * 5)
-        self.assertEqual(len(cache._lru), 0)
 
         tokens = tokens + [30] * 3
         c[0].update_and_fetch(*get_kv(8))
@@ -70,7 +69,13 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
             (k.flatten() == mx.concatenate([mx.arange(24), mx.arange(2)])).all().item()
         )
         self.assertEqual(t, [40] * 8)
-        self.assertEqual(len(cache._lru), 1)
+
+        # The 32-token entry should still be reusable after the prefix-match
+        # extraction (rewind operates on a copy, not the original).
+        full_tokens = [10] * 24 + [20] * 5 + [30] * 3
+        c2, t2 = cache.fetch_nearest_cache(model, full_tokens)
+        self.assertIsNotNone(c2)
+        self.assertEqual(t2, [])
 
     def test_lru(self):
         cache = LRUPromptCache(max_size=2)
