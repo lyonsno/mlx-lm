@@ -58,6 +58,7 @@ class DummyModelProvider:
                 "prompt_cache_size": 10,
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
+                "allowed_origins": ["*"],
             },
         )
 
@@ -73,8 +74,9 @@ class DummyModelProvider:
 
 
 class MockCache:
-    def __init__(self, value):
+    def __init__(self, value, is_trimmable: bool = True):
         self.value = value
+        self._is_trimmable = is_trimmable
 
     @property
     def nbytes(self):
@@ -82,6 +84,13 @@ class MockCache:
 
     def __eq__(self, other):
         return other.value == self.value
+
+    def is_trimmable(self):
+        return self._is_trimmable
+
+    def trim(self, n):
+        assert self._is_trimmable
+        return n
 
 
 class TestServer(unittest.TestCase):
@@ -429,13 +438,147 @@ class TestKeepalive(unittest.TestCase):
             self.fail(f"Callback should handle BrokenPipeError: {e}")
 
 
+class TestLRUPromptCache(unittest.TestCase):
+    def test_caching(self):
+        cache = LRUPromptCache(max_size=10)
+
+        def get_kv(n):
+            keys = mx.arange(n).reshape(1, 1, n, 1)
+            return keys, keys
+
+        model = ("test", None, None)
+        tokens = [10] * 24
+
+        c, t = cache.fetch_nearest_cache(model, tokens)
+        self.assertTrue(c is None)
+        self.assertEqual(t, tokens)
+
+        c = [KVCache()]
+        c[0].update_and_fetch(*get_kv(24))
+        cache.insert_cache(model, t, c)
+
+        # Fetching a cache that is strictly a prefix doesn't remove it from the
+        # lru cache
+        tokens = tokens + [20] * 5
+        c, t = cache.fetch_nearest_cache(model, tokens)
+        k, v = c[0].state
+        self.assertTrue((k == v).all().item())
+        self.assertTrue((k.flatten() == mx.arange(24)).all().item())
+        self.assertEqual(t, [20] * 5)
+        self.assertEqual(len(cache), 1)
+
+        # Inserting a trimmable cache with shared prefix removes the prefixes
+        tokens = tokens + [30] * 3
+        c[0].update_and_fetch(*get_kv(8))
+        cache.insert_cache(model, tokens, c)
+        self.assertEqual(len(cache), 1)
+
+        # Fetching a cache with a shared prefix doesn't remove it either
+        tokens = tokens[:26] + [40] * 8
+        c, t = cache.fetch_nearest_cache(model, tokens)
+        k, v = c[0].state
+        self.assertTrue((k == v).all().item())
+        self.assertTrue(
+            (k.flatten() == mx.concatenate([mx.arange(24), mx.arange(2)])).all().item()
+        )
+        self.assertEqual(t, [40] * 8)
+        self.assertEqual(len(cache), 1)
+
+        # Inserting a diverged cache actually creates another entry
+        c[0].update_and_fetch(*get_kv(8))
+        cache.insert_cache(model, tokens, c)
+        self.assertEqual(len(cache), 2)
+
+    def test_lru(self):
+        cache = LRUPromptCache(max_size=2)
+        model = ("test", None, None)
+        cache.insert_cache(model, [1, 2], [MockCache("test1")])
+        cache.insert_cache(model, [2, 3], [MockCache("test2")])
+
+        c, t = cache.fetch_nearest_cache(model, [1, 2])
+        self.assertEqual(c, [MockCache("test1")])
+        self.assertEqual(t, [])
+        c, t = cache.fetch_nearest_cache(model, [1])
+        self.assertEqual(c, [MockCache("test1")])
+        self.assertEqual(t, [1])
+        c, t = cache.fetch_nearest_cache(model, [1, 3, 4])
+        self.assertEqual(c, [MockCache("test1")])
+        self.assertEqual(t, [3, 4])
+        c, t = cache.fetch_nearest_cache(model, [2, 3, 4])
+        self.assertEqual(c, [MockCache("test2")])
+        self.assertEqual(t, [4])
+        c, t = cache.fetch_nearest_cache(model, [2, 4, 5])
+        self.assertEqual(c, [MockCache("test2")])
+        self.assertEqual(t, [4, 5])
+
+        cache.insert_cache(model, [1, 2], [MockCache("test1")])
+        cache.insert_cache(model, [2, 3], [MockCache("test2")])
+        cache.insert_cache(model, [3, 4], [MockCache("test3")])
+
+        c, t = cache.fetch_nearest_cache(model, [1, 2])
+        self.assertEqual(c, None)
+        self.assertEqual(t, [1, 2])
+        c, t = cache.fetch_nearest_cache(model, [2, 3])
+        self.assertEqual(c, [MockCache("test2")])
+        self.assertEqual(t, [])
+        c, t = cache.fetch_nearest_cache(model, [3, 4])
+        self.assertEqual(c, [MockCache("test3")])
+        self.assertEqual(t, [])
+
+        cache.insert_cache(model, [4, 5], [MockCache("test4")], cache_type="user")
+        c, t = cache.fetch_nearest_cache(model, [2, 3])
+        self.assertEqual(c, None)
+        self.assertEqual(t, [2, 3])
+        c, t = cache.fetch_nearest_cache(model, [3, 4])
+        self.assertEqual(c, [MockCache("test3")])
+        self.assertEqual(t, [])
+        c, t = cache.fetch_nearest_cache(model, [4, 5])
+        self.assertEqual(c, [MockCache("test4")])
+        self.assertEqual(t, [])
+
+        cache.insert_cache(model, [5, 6], [MockCache("test5")])
+        cache.insert_cache(model, [6, 7], [MockCache("test6")])
+        c, t = cache.fetch_nearest_cache(model, [5, 6])
+        self.assertEqual(c, None)
+        self.assertEqual(t, [5, 6])
+        c, t = cache.fetch_nearest_cache(model, [6, 7])
+        self.assertEqual(c, [MockCache("test6")])
+        self.assertEqual(t, [])
+        c, t = cache.fetch_nearest_cache(model, [4, 5])
+        self.assertEqual(c, [MockCache("test4")])
+        self.assertEqual(t, [])
+
+    def test_lru_bytes(self):
+        cache = LRUPromptCache(max_size=100, max_bytes=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [1, 2], [MockCache("aaa")])
+        cache.insert_cache(model, [3, 4], [MockCache("bbb")])
+        cache.insert_cache(model, [4, 5], [MockCache("ccc")])
+        cache.insert_cache(model, [6, 7], [MockCache("ddd")])
+
+        self.assertEqual(len(cache), 3)
+        self.assertEqual(cache.nbytes, 9)
+
+        cache.trim_to(n_bytes=7)
+        self.assertEqual(len(cache), 2)
+        self.assertEqual(cache.nbytes, 6)
+
+        c, t = cache.fetch_nearest_cache(model, [1, 2])
+        self.assertEqual(c, None)
+        self.assertEqual(t, [1, 2])
+        c, t = cache.fetch_nearest_cache(model, [3, 4])
+        self.assertEqual(c, None)
+        self.assertEqual(t, [3, 4])
+
+
 class TestResponseGeneratorPrefillStepSizeForwarding(unittest.TestCase):
     @staticmethod
     def _generation_args():
         return GenerationArguments(
             model=ModelDescription("default_model", None, None),
             sampling=SamplingArguments(0.0, 1.0, 0, 0.0, 0.0, 0.0),
-            logits=LogitsProcessorArguments(None, 1.0, 20),
+            logits=LogitsProcessorArguments(None, 1.0, 20, 0.0, 256, 0.0, 256),
             stop_words=[],
             max_tokens=2,
             num_draft_tokens=3,

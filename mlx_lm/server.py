@@ -1,17 +1,14 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
-import copy
 import json
 import logging
-import numbers
 import pickle
 import platform
 import socket
 import time
 import uuid
 import warnings
-from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -37,26 +34,19 @@ from huggingface_hub import scan_cache_dir
 from ._version import __version__
 from .cli_utils import positive_int
 from .generate import BatchGenerator, generation_stream, stream_generate
-from .models.cache import make_prompt_cache
+from .models.cache import (
+    LRUPromptCache,
+    can_trim_prompt_cache,
+    make_prompt_cache,
+    trim_prompt_cache,
+)
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import load, sharded_load
+from .utils import _parse_size, load, sharded_load
 
 
 def get_system_fingerprint():
     gpu_arch = mx.device_info()["architecture"]
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
-
-
-def parse_size(x):
-    sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
-    split = 0
-    for xi in x:
-        if not (xi.isdigit() or xi == "."):
-            break
-        split += 1
-    digits = float(x[:split])
-    size = (x[split:]).strip().upper()
-    return int(digits * sizes[size])
 
 
 class StopCondition(NamedTuple):
@@ -180,240 +170,6 @@ def process_message_content(messages):
                         func["arguments"] = json.loads(args)
 
 
-class LRUPromptCache:
-
-    @dataclass
-    class CacheEntry:
-        prompt_cache: List[Any]
-        count: int
-        nbytes: int
-
-    @dataclass
-    class SearchResult:
-        model: Any
-        exact: List[int]
-        shorter: List[int]
-        longer: List[int]
-        common_prefix: int
-
-    def __init__(self, max_size: int = 10, max_bytes: int = 1 << 63):
-        self.max_size = max_size
-        self.max_bytes = max_bytes
-        self._cache = {}
-        self._lru = deque()
-        self._n_bytes = 0
-
-    def __len__(self):
-        return len(self._lru)
-
-    @property
-    def nbytes(self):
-        return self._n_bytes
-
-    def _search(self, model, tokens):
-        """Search the cache for a prompt cache. Return exact or close match."""
-        if model not in self._cache:
-            return self.SearchResult(model, None, None, None, 0)
-
-        current = self._cache[model]
-        last_cache_index = -1
-        index = 0
-
-        while index < len(tokens) and tokens[index] in current:
-            current = current[tokens[index]]
-            if "cache" in current:
-                last_cache_index = index
-            index += 1
-
-        # Exact match no need to search for longer or shorter caches
-        if last_cache_index == len(tokens) - 1:
-            return self.SearchResult(model, tokens, None, None, 0)
-
-        # Find the shorter cache
-        shorter = None
-        if last_cache_index > 0:
-            shorter = tokens[: last_cache_index + 1]
-
-        # Check for caches that are longer
-        longer = None
-        common_prefix = index
-        if index > 0 and last_cache_index <= 0:
-            best = None
-            stack = [(current, [])]
-            while stack:
-                current, extra = stack.pop()
-                if "cache" in current:
-                    if best is None or len(extra) < len(best):
-                        best = extra
-                else:
-                    for tok in current:
-                        stack.append((current[tok], extra + [tok]))
-            longer = tokens[:index] + best
-        return self.SearchResult(model, None, shorter, longer, common_prefix)
-
-    def _get(self, model, tokens):
-        current = self._cache[model]
-        for tok in tokens:
-            current = current[tok]
-        return current["cache"]
-
-    def _delete(self, model, tokens):
-        path = [self._cache[model]]
-        for tok in tokens:
-            path.append(path[-1][tok])
-        cache_bytes = path[-1]["cache"].nbytes
-        self._n_bytes -= cache_bytes
-        del path[-1]["cache"]
-        for i in reversed(range(len(tokens))):
-            d_prev, d, t = path[i], path[i + 1], tokens[i]
-            if len(d) > 0:
-                break
-            del d_prev[t]
-
-        logging.debug(f"[LRUPromptCache] Removed {cache_bytes} bytes from the cache")
-
-    def _extract(self, model, tokens):
-        cache_entry = self._get(model, tokens)
-        if cache_entry.count == 1:
-            self._delete(model, tokens)
-            self._lru.remove((model, tokens))
-            return cache_entry
-
-        cache_entry.count -= 1
-        return self.CacheEntry(
-            copy.deepcopy(cache_entry.prompt_cache), 1, cache_entry.nbytes
-        )
-
-    def _can_rewind_layer_cache(self, layer_cache, num_to_trim):
-        can_rewind = getattr(layer_cache, "can_rewind", None)
-        rewind = getattr(layer_cache, "rewind", None)
-        is_trimmable = getattr(layer_cache, "is_trimmable", None)
-        trim = getattr(layer_cache, "trim", None)
-        if callable(can_rewind):
-            has_execution_path = callable(rewind) or (
-                callable(is_trimmable) and callable(trim)
-            )
-            if not has_execution_path:
-                return False
-            try:
-                return bool(can_rewind(num_to_trim))
-            except Exception:
-                return False
-
-        # Compatibility fallback for custom caches that only implement the
-        # legacy is_trimmable()/trim()/rewind() contract.
-        if not callable(is_trimmable) or (not callable(trim) and not callable(rewind)):
-            return False
-        try:
-            if not bool(is_trimmable()):
-                return False
-            if num_to_trim <= 0:
-                return True
-
-            # If legacy cache exposes an offset, avoid deepcopy on guaranteed
-            # misses where trim can never satisfy the requested rewind.
-            offset = getattr(layer_cache, "offset", None)
-            if isinstance(offset, numbers.Integral):
-                return num_to_trim <= offset
-            return True
-        except Exception:
-            return False
-
-    def _can_rewind_prompt_cache(self, cache, num_to_trim):
-        return all(
-            self._can_rewind_layer_cache(layer_cache, num_to_trim)
-            for layer_cache in cache
-        )
-
-    def _rewind_layer_cache(self, layer_cache, num_to_trim):
-        rewind = getattr(layer_cache, "rewind", None)
-        if callable(rewind):
-            try:
-                return bool(rewind(num_to_trim))
-            except Exception:
-                return False
-
-        # Compatibility fallback for custom caches that only implement the
-        # legacy is_trimmable()/trim() contract.
-        is_trimmable = getattr(layer_cache, "is_trimmable", None)
-        trim = getattr(layer_cache, "trim", None)
-        if not callable(is_trimmable) or not callable(trim):
-            return False
-        try:
-            return bool(is_trimmable()) and trim(num_to_trim) == num_to_trim
-        except Exception:
-            return False
-
-    def _rewind_prompt_cache(self, cache, num_to_trim):
-        return all(
-            self._rewind_layer_cache(layer_cache, num_to_trim) for layer_cache in cache
-        )
-
-    def fetch_nearest_cache(self, model, tokens):
-        result = self._search(model, tokens)
-        if result.exact is not None:
-            cache_entry = self._extract(result.model, result.exact)
-            return cache_entry.prompt_cache, []
-
-        if result.shorter is not None:
-            cache_entry = self._extract(result.model, result.shorter)
-            prefix_len = len(result.shorter)
-            return cache_entry.prompt_cache, tokens[prefix_len:]
-
-        if result.longer is not None:
-            cache_entry = self._get(result.model, result.longer)
-            prefix = min(len(tokens) - 1, result.common_prefix)
-            num_to_trim = len(result.longer) - prefix
-
-            if not self._can_rewind_prompt_cache(cache_entry.prompt_cache, num_to_trim):
-                return None, tokens
-
-            cache = copy.deepcopy(cache_entry.prompt_cache)
-            if self._rewind_prompt_cache(cache, num_to_trim):
-                return cache, tokens[prefix:]
-
-        return None, tokens
-
-    def insert_cache(self, model, tokens, prompt_cache):
-        if model not in self._cache:
-            self._cache[model] = {}
-        current = self._cache[model]
-        for tok in tokens:
-            if tok not in current:
-                current[tok] = {}
-            current = current[tok]
-
-        if "cache" in current:
-            current["cache"].count += 1
-            self._lru.remove((model, tokens))
-        else:
-            cache_bytes = sum(c.nbytes for c in prompt_cache)
-            current["cache"] = self.CacheEntry(prompt_cache, 1, cache_bytes)
-            self._n_bytes += cache_bytes
-            logging.debug(f"[LRUPromptCache] Adding {cache_bytes} to the cache")
-
-        self._lru.append((model, tokens))
-        if len(self._lru) > self.max_size:
-            model, tokens = self._lru.popleft()
-            self._delete(model, tokens)
-        while self._n_bytes > self.max_bytes and len(self._lru) > 1:
-            model, tokens = self._lru.popleft()
-            self._delete(model, tokens)
-
-    def trim_to(
-        self, *, n_sequences: Optional[int] = None, n_bytes: Optional[int] = None
-    ):
-        n_sequences = max(0, n_sequences) if n_sequences is not None else 1 << 63
-        n_bytes = max(0, n_bytes) if n_bytes is not None else 1 << 63
-
-        while len(self._lru) > n_sequences:
-            model, tokens = self._lru.popleft()
-            self._delete(model, tokens)
-        while self._n_bytes > n_bytes:
-            model, tokens = self._lru.popleft()
-            self._delete(model, tokens)
-
-
 @dataclass
 class ModelDescription:
     model: str
@@ -436,6 +192,10 @@ class LogitsProcessorArguments:
     logit_bias: Optional[Dict[int, float]]
     repetition_penalty: float
     repetition_context_size: int
+    presence_penalty: float
+    presence_context_size: int
+    frequency_penalty: float
+    frequency_context_size: int
 
 
 @dataclass
@@ -664,6 +424,10 @@ def _make_logits_processors(args):
         args.logits.logit_bias,
         args.logits.repetition_penalty,
         args.logits.repetition_context_size,
+        args.logits.presence_penalty,
+        args.logits.presence_context_size,
+        args.logits.frequency_penalty,
+        args.logits.frequency_context_size,
     )
 
 
@@ -700,6 +464,11 @@ class ResponseGenerator:
 
     def join(self):
         self._generation_thread.join()
+
+    def _log_cache_stats(self):
+        ncaches = len(self.prompt_cache)
+        nbytes = self.prompt_cache.nbytes
+        logging.info(f"KV Caches: {ncaches} seq, {nbytes / 1e9:.2f} GB")
 
     def _next_request(self, timeout=None):
         request = None
@@ -780,6 +549,24 @@ class ResponseGenerator:
         else:
             return tokenizer.encode(request.prompt)
 
+    def _compute_prompt_checkpoint(self, tokenizer, request, prompt):
+        if request.request_type != "chat":
+            return False, -1
+        if request.messages[-1]["role"] != "user":
+            return False, -1
+
+        # Save the KV cache at the end of the prompt just before
+        # the think start token which will likely be removed in the
+        # next turn.
+        prompt_checkpoint = -1
+        if tokenizer.has_thinking:
+            for i in range(1, min(11, len(prompt)) - 1, 1):
+                if prompt[-i] == tokenizer.think_start_id:
+                    prompt_checkpoint = -i - 1
+                    break
+
+        return True, prompt_checkpoint
+
     def _is_batchable(self, args):
         if not self.model_provider.is_batchable:
             return False
@@ -809,6 +596,18 @@ class ResponseGenerator:
             for uid, processed, total in info:
                 if uid in batch_results:
                     batch_results[uid]["rqueue"].put((min(processed, total), total))
+
+        def checkpoint_callback(prompts):
+            for uid, prompt_end, cache in prompts:
+                rs = batch_results[uid]
+                if not rs["checkpoint"]:
+                    continue
+                self.prompt_cache.insert_cache(
+                    current_model_key,
+                    rs["cache_key"][:-prompt_end],
+                    list(cache),
+                    cache_type="user",
+                )
 
         if self._is_distributed:
             seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
@@ -858,6 +657,7 @@ class ResponseGenerator:
                     )
                     rqueue.put(ctx)
 
+                    self._log_cache_stats()
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
                     )
@@ -865,9 +665,8 @@ class ResponseGenerator:
                     if cache is None:
                         cache = make_prompt_cache(self.model_provider.model)
 
-                    ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
-                    logging.info(
-                        f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB"
+                    do_checkpoint, checkpoint_position = (
+                        self._compute_prompt_checkpoint(tokenizer, request, prompt)
                     )
 
                     (uid,) = batch_generator.insert(
@@ -876,12 +675,14 @@ class ResponseGenerator:
                         caches=[cache],
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
+                        prompt_checkpoints=[checkpoint_position],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
                         "cache_key": prompt[:],
                         "rqueue": rqueue,
                         "detokenizer": tokenizer.detokenizer,
+                        "checkpoint": do_checkpoint,
                     }
                     # just making sure we don't leave a reference around
                     del cache
@@ -919,6 +720,7 @@ class ResponseGenerator:
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
                         prompt_progress_callback=progress_callback,
+                        prompt_checkpoint_callback=checkpoint_callback,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -1036,6 +838,7 @@ class ResponseGenerator:
             logits_processors = _make_logits_processors(args)
 
             # Load the KV cache
+            self._log_cache_stats()
             cache, rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, prompt
             )
@@ -1045,9 +848,6 @@ class ResponseGenerator:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
-
-            ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
-            logging.info(f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB")
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -1141,7 +941,13 @@ class APIHandler(BaseHTTPRequestHandler):
         super().__init__(*args, **kwargs)
 
     def _set_cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        allowed_origins = self.response_generator.cli_args.allowed_origins
+        origin = self.headers.get("Origin")
+        if "*" in allowed_origins:
+            self.send_header("Access-Control-Allow-Origin", "*")
+        elif origin in allowed_origins:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "*")
         self.send_header("Access-Control-Allow-Headers", "*")
 
@@ -1177,7 +983,23 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         # Fetch and parse request body
-        content_length = int(self.headers["Content-Length"])
+        content_length = self.headers.get("Content-Length")
+        if content_length is None:
+            self._set_completion_headers(411)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "Content-Length header is required"}).encode()
+            )
+            return
+        try:
+            content_length = int(content_length)
+        except ValueError:
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "Invalid Content-Length header"}).encode()
+            )
+            return
         raw_body = self.rfile.read(content_length)
         try:
             self.body = json.loads(raw_body.decode())
@@ -1218,6 +1040,10 @@ class APIHandler(BaseHTTPRequestHandler):
         self.min_p = self.body.get("min_p", self.response_generator.cli_args.min_p)
         self.repetition_penalty = self.body.get("repetition_penalty", 0.0)
         self.repetition_context_size = self.body.get("repetition_context_size", 20)
+        self.presence_penalty = self.body.get("presence_penalty", 0.0)
+        self.presence_context_size = self.body.get("presence_context_size", 20)
+        self.frequency_penalty = self.body.get("frequency_penalty", 0.0)
+        self.frequency_context_size = self.body.get("frequency_context_size", 20)
         self.xtc_probability = self.body.get("xtc_probability", 0.0)
         self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
         self.logit_bias = self.body.get("logit_bias", None)
@@ -1266,6 +1092,25 @@ class APIHandler(BaseHTTPRequestHandler):
             or self.repetition_penalty < 0
         ):
             raise ValueError("repetition_penalty must be a non-negative float")
+        if (
+            not isinstance(self.repetition_context_size, int)
+            or self.repetition_context_size < 0
+        ):
+            raise ValueError("repetition_context_size must be a non-negative integer")
+        if not isinstance(self.presence_penalty, (float, int)):
+            raise ValueError("Presence penalty must be must be a float")
+        if (
+            not isinstance(self.presence_context_size, int)
+            or self.presence_context_size < 0
+        ):
+            raise ValueError("presence_context_size must be a non-negative integer")
+        if not isinstance(self.frequency_penalty, (float, int)):
+            raise ValueError("Presence penalty must be must be a float")
+        if (
+            not isinstance(self.frequency_context_size, int)
+            or self.frequency_context_size < 0
+        ):
+            raise ValueError("frequency_context_size must be a non-negative integer")
 
         if not isinstance(self.logprobs, bool):
             raise ValueError("logprobs must be a boolean")
@@ -1274,12 +1119,6 @@ class APIHandler(BaseHTTPRequestHandler):
             raise ValueError(
                 f"top_logprobs must be between 1 and 10 but got {self.top_logprobs:,}"
             )
-
-        if (
-            not isinstance(self.repetition_context_size, int)
-            or self.repetition_context_size < 0
-        ):
-            raise ValueError("repetition_context_size must be a non-negative integer")
 
         if self.logit_bias is not None:
             if not isinstance(self.logit_bias, dict):
@@ -1440,6 +1279,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 logit_bias=self.logit_bias,
                 repetition_penalty=self.repetition_penalty,
                 repetition_context_size=self.repetition_context_size,
+                presence_penalty=self.presence_penalty,
+                presence_context_size=self.presence_context_size,
+                frequency_penalty=self.frequency_penalty,
+                frequency_context_size=self.frequency_context_size,
             ),
             stop_words=stop_words,
             max_tokens=self.max_tokens,
@@ -1889,6 +1732,12 @@ def setup_arg_parser():
         help="Port for the HTTP server (default: 8080)",
     )
     parser.add_argument(
+        "--allowed-origins",
+        type=lambda x: x.split(","),
+        default="*",
+        help="Allowed origins (default: *)",
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         help="A model to be used for speculative decoding.",
@@ -1986,7 +1835,7 @@ def setup_arg_parser():
     )
     parser.add_argument(
         "--prompt-cache-bytes",
-        type=parse_size,
+        type=_parse_size,
         help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(

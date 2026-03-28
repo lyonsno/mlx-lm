@@ -81,20 +81,17 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
         cache = LRUPromptCache(max_size=2)
         model = ("test", None, None)
         cache.insert_cache(model, [1, 2], [MockCache("test1")])
-        cache.insert_cache(model, [1, 2], [MockCache("test1")])
-
-        c, t = cache.fetch_nearest_cache(model, [1, 2])
-        self.assertEqual(c, [MockCache("test1")])
-        self.assertEqual(t, [])
-        c, t = cache.fetch_nearest_cache(model, [1, 2])
-        self.assertEqual(c, [MockCache("test1")])
-        self.assertEqual(t, [])
-        c, t = cache.fetch_nearest_cache(model, [1, 2])
-        self.assertIsNone(c)
-        self.assertEqual(t, [1, 2])
-
-        cache.insert_cache(model, [1, 2], [MockCache("test1")])
         cache.insert_cache(model, [2, 3], [MockCache("test2")])
+
+        # Fetches return deepcopies; entries persist until evicted.
+        c, t = cache.fetch_nearest_cache(model, [1, 2])
+        self.assertEqual(c, [MockCache("test1")])
+        self.assertEqual(t, [])
+        c, t = cache.fetch_nearest_cache(model, [1, 2])
+        self.assertEqual(c, [MockCache("test1")])
+        self.assertEqual(t, [])
+
+        # Third entry evicts the oldest (max_size=2).
         cache.insert_cache(model, [3, 4], [MockCache("test3")])
 
         c, t = cache.fetch_nearest_cache(model, [1, 2])
@@ -152,48 +149,24 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
 
     def test_unknown_layer_safe_miss_variants(self):
         scenarios = [
-            (
-                "unknown_non_trimmable_refcounted",
-                UnknownNonTrimmableLayer,
-                2,
-            ),
-            (
-                "unknown_non_trimmable_no_deepcopy",
-                UnknownNonTrimmableNoDeepcopy,
-                1,
-            ),
-            (
-                "unknown_no_legacy_hooks_no_deepcopy",
-                UnknownLayerWithoutLegacyHooks,
-                1,
-            ),
+            ("unknown_non_trimmable", UnknownNonTrimmableLayer),
+            ("unknown_non_trimmable_no_deepcopy", UnknownNonTrimmableNoDeepcopy),
+            ("unknown_no_legacy_hooks", UnknownLayerWithoutLegacyHooks),
         ]
 
         long_tokens = [1, 2, 3, 4]
         shorter_tokens = [1, 2]
 
-        for name, layer_factory, insert_count in scenarios:
+        for name, layer_factory in scenarios:
             with self.subTest(name=name):
                 lru = LRUPromptCache(max_size=10)
                 model = (f"{name}", None, None)
+                lru.insert_cache(model, long_tokens, [layer_factory()])
 
-                for _ in range(insert_count):
-                    lru.insert_cache(model, long_tokens, [layer_factory()])
-
+                # Rewind path should be a safe miss for unknown layers.
                 reused_cache, remaining = lru.fetch_nearest_cache(model, shorter_tokens)
                 self.assertIsNone(reused_cache)
                 self.assertEqual(remaining, shorter_tokens)
-
-                for _ in range(insert_count):
-                    exact_cache, exact_remaining = lru.fetch_nearest_cache(
-                        model, long_tokens
-                    )
-                    self.assertIsNotNone(exact_cache)
-                    self.assertEqual(exact_remaining, [])
-
-                miss, miss_remaining = lru.fetch_nearest_cache(model, long_tokens)
-                self.assertIsNone(miss)
-                self.assertEqual(miss_remaining, long_tokens)
 
     def test_legacy_trimmable_layer_without_rewind_api_still_reuses(self):
         trim_calls = []
@@ -289,7 +262,7 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
         self.assertEqual(exact_remaining, [])
         self.assertEqual(exact_cache[0].offset, 4)
 
-    def test_can_rewind_only_layer_without_rewind_path_safe_miss_skips_deepcopy(self):
+    def test_can_rewind_only_layer_without_rewind_path_is_safe_miss(self):
         class CanRewindOnlyNoExecutionLayer:
             def __init__(self):
                 self.offset = 4
@@ -300,11 +273,6 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
 
             def can_rewind(self, n):
                 return True
-
-            def __deepcopy__(self, memo):
-                raise AssertionError(
-                    "deepcopy should be skipped when can_rewind layer cannot execute rewind"
-                )
 
         lru = LRUPromptCache(max_size=10)
         model = ("can-rewind-only-no-execution", None, None)
@@ -323,7 +291,7 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
         self.assertEqual(exact_remaining, [])
         self.assertEqual(exact_cache[0].offset, 4)
 
-    def test_legacy_offset_insufficient_safe_miss_skips_deepcopy(self):
+    def test_legacy_offset_insufficient_is_safe_miss(self):
         class LegacyOffsetLimitedLayer:
             def __init__(self):
                 self.offset = 2
@@ -341,11 +309,6 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
                 trimmed = min(n, self.offset)
                 self.offset -= trimmed
                 return trimmed
-
-            def __deepcopy__(self, memo):
-                raise AssertionError(
-                    "deepcopy should be skipped for offset-bounded legacy miss"
-                )
 
         lru = LRUPromptCache(max_size=10)
         model = ("legacy-offset-insufficient", None, None)
@@ -559,21 +522,18 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
                 mx.allclose(reused_logits, baseline_logits, rtol=1e-5, atol=1e-5)
             )
 
-    def test_longer_hit_unrecoverable_rotating_miss_skips_deepcopy(self):
+    def test_longer_hit_unrecoverable_rotating_miss_preserves_exact_entry(self):
         lru = LRUPromptCache(max_size=10)
-        model = ("skip-deepcopy", None, None)
+        model = ("unrecoverable-rotating", None, None)
         long_tokens = [1, 2, 3, 4]
         shorter_tokens = [1, 2]
 
+        safe_layer = RewindRecorderLayer(max_rewind=10, rewind_result=True)
         unrecoverable = build_real_rotating_cache()
         unrecoverable.offset = unrecoverable.keys.shape[2] + 1
         unrecoverable._idx = unrecoverable.keys.shape[2]
 
-        lru.insert_cache(
-            model,
-            long_tokens,
-            [DeepcopyShouldNotRunLayer(), unrecoverable],
-        )
+        lru.insert_cache(model, long_tokens, [safe_layer, unrecoverable])
 
         reused_cache, remaining = lru.fetch_nearest_cache(model, shorter_tokens)
         self.assertIsNone(reused_cache)
@@ -583,7 +543,7 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
         self.assertIsNotNone(exact_cache)
         self.assertEqual(exact_remaining, [])
 
-    def test_mixed_cache_longer_prefix_reuse_preserves_refcounted_long_entry(self):
+    def test_mixed_cache_longer_prefix_reuse_preserves_long_entry(self):
         lru = LRUPromptCache(max_size=10)
         model_key = ("step3p5-tiny", None, None)
         model = make_tiny_step3p5_model()
@@ -596,23 +556,21 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
         mx.eval(model(long_array, cache=long_cache))
 
         lru.insert_cache(model_key, long_tokens, long_cache)
-        lru.insert_cache(model_key, long_tokens, long_cache)
 
+        # Rewind extraction for shorter prefix should not destroy the original.
         reused_cache, remaining = lru.fetch_nearest_cache(model_key, shorter_tokens)
         self.assertIsNotNone(reused_cache)
         self.assertEqual(remaining, shorter_tokens[-1:])
 
+        # Original entry still available via exact match.
         hit1, rem1 = lru.fetch_nearest_cache(model_key, long_tokens)
         self.assertIsNotNone(hit1)
         self.assertEqual(rem1, [])
 
+        # Entry persists (no refcounting — deepcopy on fetch).
         hit2, rem2 = lru.fetch_nearest_cache(model_key, long_tokens)
         self.assertIsNotNone(hit2)
         self.assertEqual(rem2, [])
-
-        miss, rem3 = lru.fetch_nearest_cache(model_key, long_tokens)
-        self.assertIsNone(miss)
-        self.assertEqual(rem3, long_tokens)
 
     def test_mixed_cache_longer_prefix_reuse_misses_after_decode_rotation(self):
         lru = LRUPromptCache(max_size=10)
@@ -666,7 +624,6 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
         stored_snapshot = copy.deepcopy(long_cache)
 
         lru.insert_cache(model_key, decoded_tokens, long_cache)
-        lru.insert_cache(model_key, decoded_tokens, long_cache)
         reused_cache, remaining = lru.fetch_nearest_cache(model_key, shorter_tokens)
         self.assertIsNone(reused_cache)
         self.assertEqual(remaining, shorter_tokens)
@@ -681,19 +638,18 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
                 self.assertTrue(mx.array_equal(fk, sk))
                 self.assertTrue(mx.array_equal(fv, sv))
 
+        # After a rotation-based safe miss, the exact entry's arrays
+        # still match the original snapshot.
         hit1, rem1 = lru.fetch_nearest_cache(model_key, decoded_tokens)
         self.assertIsNotNone(hit1)
         self.assertEqual(rem1, [])
         assert_matches_snapshot(hit1)
 
+        # Entry persists — second fetch still matches.
         hit2, rem2 = lru.fetch_nearest_cache(model_key, decoded_tokens)
         self.assertIsNotNone(hit2)
         self.assertEqual(rem2, [])
         assert_matches_snapshot(hit2)
-
-        miss, rem3 = lru.fetch_nearest_cache(model_key, decoded_tokens)
-        self.assertIsNone(miss)
-        self.assertEqual(rem3, decoded_tokens)
 
 
 if __name__ == "__main__":
