@@ -8,7 +8,6 @@ import mlx.core as mx
 from mlx_lm.models.cache import CacheList, KVCache, RotatingKVCache
 from mlx_lm.server import LRUPromptCache
 from tests.prompt_cache_test_utils import (
-    DeepcopyShouldNotRunLayer,
     LegacyTrimLayer,
     RewindRecorderLayer,
     UnknownLayerWithoutLegacyHooks,

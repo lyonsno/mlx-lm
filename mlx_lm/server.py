@@ -34,12 +34,7 @@ from huggingface_hub import scan_cache_dir
 from ._version import __version__
 from .cli_utils import positive_int
 from .generate import BatchGenerator, generation_stream, stream_generate
-from .models.cache import (
-    LRUPromptCache,
-    can_trim_prompt_cache,
-    make_prompt_cache,
-    trim_prompt_cache,
-)
+from .models.cache import LRUPromptCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
