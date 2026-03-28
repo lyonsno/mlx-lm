@@ -26,6 +26,10 @@ from mlx_lm.models.cache import (
     trim_prompt_cache,
 )
 from mlx_lm.utils import load
+from tests.prompt_cache_test_utils import (
+    build_real_rotating_cache,
+    snapshot_cache_arrays,
+)
 
 HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
 
@@ -797,6 +801,103 @@ class TestPromptCache(unittest.TestCase):
         mask = create_attention_mask(h, c, window_size=4)
         expected = create_causal_mask(1, offset=32, window_size=4)
         self.assertTrue(mx.array_equal(mask, expected))
+
+
+class TestRotatingKVCacheRewind(unittest.TestCase):
+
+    def test_failure_paths_preserve_state(self):
+        def missing_values(cache):
+            cache.values = None
+            return 2
+
+        def exceeds_offset(cache):
+            return cache.offset + 1
+
+        def unrecoverable_history(cache):
+            cache.offset = cache.keys.shape[2] + 1
+            cache._idx = cache.keys.shape[2]
+            return 1
+
+        def exceeds_idx(cache):
+            cache._idx = 0
+            return 1
+
+        scenarios = [
+            ("missing_values", missing_values),
+            ("trim_exceeds_offset", exceeds_offset),
+            ("history_unrecoverable", unrecoverable_history),
+            ("trim_exceeds_idx", exceeds_idx),
+        ]
+
+        for name, configure in scenarios:
+            with self.subTest(name=name):
+                cache = build_real_rotating_cache()
+                num_to_trim = configure(cache)
+                original_offset = cache.offset
+                original_idx = cache._idx
+                original_keys, original_values = snapshot_cache_arrays(cache)
+
+                self.assertFalse(cache.can_rewind(num_to_trim))
+                self.assertFalse(cache.rewind(num_to_trim))
+                self.assertEqual(cache.offset, original_offset)
+                self.assertEqual(cache._idx, original_idx)
+                self.assertTrue(mx.array_equal(cache.keys, original_keys))
+                if original_values is None:
+                    self.assertIsNone(cache.values)
+                else:
+                    self.assertTrue(mx.array_equal(cache.values, original_values))
+
+    def test_materializes_state_for_single_token_updates(self):
+        total_tokens = 8
+        trim_tokens = 3
+        expected_prefix = total_tokens - trim_tokens
+
+        rewound = build_real_rotating_cache(total_tokens=total_tokens)
+        self.assertTrue(rewound.can_rewind(trim_tokens))
+        self.assertTrue(rewound.rewind(trim_tokens))
+
+        next_tok = mx.array([[[[99.0]]]], dtype=mx.float32)
+        rewound.update_and_fetch(next_tok, next_tok)
+        mx.eval(rewound.keys, rewound.values)
+
+        baseline = build_real_rotating_cache(total_tokens=expected_prefix)
+        baseline.update_and_fetch(next_tok, next_tok)
+        mx.eval(baseline.keys, baseline.values)
+
+        self.assertEqual(rewound.offset, baseline.offset)
+        self.assertEqual(rewound._idx, baseline._idx)
+        self.assertTrue(mx.array_equal(rewound.keys, baseline.keys))
+        self.assertTrue(mx.array_equal(rewound.values, baseline.values))
+
+    def test_zero_trim_is_noop(self):
+        cache = build_real_rotating_cache(total_tokens=4)
+        original_offset = cache.offset
+        original_idx = cache._idx
+        original_keys, original_values = snapshot_cache_arrays(cache)
+
+        self.assertTrue(cache.can_rewind(0))
+        self.assertTrue(cache.rewind(0))
+        self.assertEqual(cache.offset, original_offset)
+        self.assertEqual(cache._idx, original_idx)
+        self.assertTrue(mx.array_equal(cache.keys, original_keys))
+        self.assertTrue(mx.array_equal(cache.values, original_values))
+
+    def test_clamps_idx_after_state_materialization(self):
+        cache = RotatingKVCache(max_size=8)
+        for tok in range(6):
+            kv = mx.array([[[[float(tok)]]]], dtype=mx.float32)
+            cache.update_and_fetch(kv, kv)
+        mx.eval(cache.keys, cache.values)
+
+        self.assertLess(cache.offset, cache.keys.shape[2])
+        cache._idx = cache.keys.shape[2]
+        self.assertGreater(cache._idx, cache.offset)
+
+        self.assertTrue(cache.can_rewind(1))
+        self.assertTrue(cache.rewind(1))
+        self.assertEqual(cache.offset, 5)
+        self.assertEqual(cache.keys.shape[2], 5)
+        self.assertEqual(cache._idx, cache.keys.shape[2])
 
 
 if __name__ == "__main__":
