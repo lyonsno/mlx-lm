@@ -16,6 +16,7 @@ from tests.prompt_cache_test_utils import (
     UnknownNonTrimmableNoDeepcopy,
     build_real_rotating_cache,
     make_tiny_step3p5_model,
+    snapshot_cache_arrays,
 )
 
 
@@ -497,9 +498,18 @@ class TestLRUPromptCacheBehavior(unittest.TestCase):
             [DeepcopyShouldNotRunLayer(), unrecoverable],
         )
 
+        pre_offset = unrecoverable.offset
+        pre_idx = unrecoverable._idx
+        pre_keys, pre_values = snapshot_cache_arrays(unrecoverable)
+
         reused_cache, remaining = lru.fetch_nearest_cache(model, shorter_tokens)
         self.assertIsNone(reused_cache)
         self.assertEqual(remaining, shorter_tokens)
+
+        self.assertEqual(unrecoverable.offset, pre_offset)
+        self.assertEqual(unrecoverable._idx, pre_idx)
+        self.assertTrue(mx.array_equal(unrecoverable.keys, pre_keys))
+        self.assertTrue(mx.array_equal(unrecoverable.values, pre_values))
 
         exact_cache, exact_remaining = lru.fetch_nearest_cache(model, long_tokens)
         self.assertIsNotNone(exact_cache)
