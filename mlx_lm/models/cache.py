@@ -1394,11 +1394,11 @@ class BatchRotatingKVCache(_BaseCache):
 
         keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
         values = mx.zeros((B, H, max_length, Dv), dtype=dt)
-        for i, (p, c) in enumerate(zip(padding, caches)):
+        for i, (p, l, c) in enumerate(zip(padding, lengths, caches)):
             if c.keys is None:
                 continue
-            keys[i : i + 1, :, p : p + c._idx] = c._temporal_order(c.keys)
-            values[i : i + 1, :, p : p + c._idx] = c._temporal_order(c.values)
+            keys[i : i + 1, :, p : p + l] = c._temporal_order(c.keys)[..., -l:, :]
+            values[i : i + 1, :, p : p + l] = c._temporal_order(c.values)[..., -l:, :]
 
         cache = cls(caches[0].max_size, padding)
         cache.keys = keys
