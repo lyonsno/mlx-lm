@@ -16,7 +16,7 @@ from mlx_lm.generate import (
     speculative_generate_step,
     stream_generate,
 )
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
@@ -117,6 +117,49 @@ class TestGenerate(unittest.TestCase):
         # from the target model, and last two should be drafts
         self.assertEqual(drafted, [True, True, False, True, True])
 
+    def test_generate_step_prompt_boundary_callback_captures_owned_prompt_cache(self):
+        prompt = self.tokenizer.encode("hello")
+        prompt_cache = make_prompt_cache(self.model)
+        captured = []
+
+        def on_prompt_boundary(boundary_cache):
+            captured.append(boundary_cache)
+
+        gen = generate_step(
+            mx.array(prompt),
+            self.model,
+            prompt_cache=prompt_cache,
+            max_tokens=2,
+            prompt_cache_capture_callback=on_prompt_boundary,
+        )
+        next(gen)
+        next(gen)
+
+        self.assertEqual(len(captured), 1)
+        self.assertTrue(all(c.offset == len(prompt) for c in captured[0]))
+        self.assertTrue(all(c.offset > len(prompt) for c in prompt_cache))
+
+    def test_batch_generator_prompt_boundary_callback_captures_prompt_boundary(self):
+        prompt = self.tokenizer.encode("hello")
+        captured = {}
+
+        def on_prompt_boundary(entries):
+            for uid, boundary_cache in entries:
+                captured[uid] = boundary_cache
+
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            prompt_cache_capture_callback=on_prompt_boundary,
+        )
+        (uid,) = batch_gen.insert([prompt])
+
+        responses = batch_gen.next()
+        self.assertEqual(len(responses), 1)
+        self.assertIn(uid, captured)
+        self.assertTrue(all(c.offset == len(prompt) for c in captured[uid]))
+        self.assertTrue(all(c.offset > len(prompt) for c in responses[0].prompt_cache))
+
     def test_speculative_rewind_uses_recoverable_non_trimmable_cache(self):
         class RewindOnlyLayer:
             def __init__(self, offset):
@@ -171,6 +214,32 @@ class TestGenerate(unittest.TestCase):
         self.assertFalse(results[0][2])
         self.assertEqual(model_cache.offset, 1)
         self.assertEqual(draft_cache.offset, 2)
+
+    def test_speculative_prompt_boundary_callback_captures_both_prompt_caches(self):
+        prompt = mx.array(self.tokenizer.encode("hello"), dtype=mx.uint32)
+        prompt_cache = make_prompt_cache(self.model) + make_prompt_cache(self.model)
+        captured = []
+
+        def on_prompt_boundary(boundary_cache):
+            captured.append(boundary_cache)
+
+        results = list(
+            speculative_generate_step(
+                prompt,
+                self.model,
+                self.model,
+                prompt_cache=prompt_cache,
+                num_draft_tokens=1,
+                max_tokens=1,
+                prompt_cache_capture_callback=on_prompt_boundary,
+            )
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(len(captured[0]), len(prompt_cache))
+        self.assertTrue(all(c.offset == len(prompt) for c in captured[0]))
+        self.assertTrue(all(c.offset >= len(prompt) for c in prompt_cache))
 
     def test_stream_generate_input_embeddings(self):
         sampler = make_sampler(temp=0.0)  # determinate sampler

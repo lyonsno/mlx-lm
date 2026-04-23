@@ -344,6 +344,61 @@ class TestPromptCache(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "broken cache state"):
             can_rewind_prompt_cache([BrokenLayer()], 1)
 
+    def test_rotating_cache_chunked_prefill_can_rewind_to_earlier_boundary(self):
+        kv = mx.arange(12, dtype=mx.float32).reshape(1, 1, 12, 1)
+
+        cache = RotatingKVCache(max_size=4)
+        cache.update_and_fetch(kv[..., :8, :], kv[..., :8, :])
+        cache.update_and_fetch(kv[..., 8:, :], kv[..., 8:, :])
+
+        baseline = RotatingKVCache(max_size=4)
+        baseline.update_and_fetch(kv[..., :8, :], kv[..., :8, :])
+        baseline.update_and_fetch(kv[..., 8:9, :], kv[..., 8:9, :])
+
+        self.assertTrue(can_rewind_prompt_cache([cache], 3))
+        self.assertTrue(rewind_prompt_cache([cache], 3))
+        self.assertEqual(cache.offset, baseline.offset)
+        self.assertTrue(
+            mx.array_equal(
+                cache._temporal_order(cache.keys),
+                baseline._temporal_order(baseline.keys),
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(
+                cache._temporal_order(cache.values),
+                baseline._temporal_order(baseline.values),
+            )
+        )
+
+        next_tok = kv[..., 9:10, :]
+        cache.update_and_fetch(next_tok, next_tok)
+        baseline.update_and_fetch(next_tok, next_tok)
+        self.assertEqual(cache.offset, baseline.offset)
+        self.assertTrue(
+            mx.array_equal(
+                cache._temporal_order(cache.keys),
+                baseline._temporal_order(baseline.keys),
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(
+                cache._temporal_order(cache.values),
+                baseline._temporal_order(baseline.values),
+            )
+        )
+
+    def test_rotating_cache_rolling_overflow_cannot_rewind_missing_prefix(self):
+        kv = mx.arange(6, dtype=mx.float32).reshape(1, 1, 6, 1)
+
+        cache = RotatingKVCache(max_size=4)
+        for i in range(6):
+            tok = kv[..., i : i + 1, :]
+            cache.update_and_fetch(tok, tok)
+
+        self.assertFalse(can_rewind_prompt_cache([cache], 2))
+        self.assertFalse(rewind_prompt_cache([cache], 2))
+
     def test_cache_copying(self):
         cache = [KVCache()]
 

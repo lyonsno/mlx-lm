@@ -660,6 +660,52 @@ class RotatingKVCache(_BaseCache):
         self._idx -= n
         return n
 
+    def can_rewind(self, num_to_trim: int) -> bool:
+        if num_to_trim <= 0:
+            return True
+        if self.keys is None or self.values is None:
+            return False
+        if self._idx < 0 or self._idx > self.keys.shape[2]:
+            return False
+        if num_to_trim > self.offset or num_to_trim > self._idx:
+            return False
+
+        if self.offset > self.keys.shape[2]:
+            has_chunked_concat_history = (
+                self._idx == self.keys.shape[2] and self.keys.shape[2] > self.max_size
+            )
+            if not has_chunked_concat_history:
+                return False
+
+        new_offset = self.offset - num_to_trim
+        new_idx = self._idx - num_to_trim
+        if new_offset >= self.max_size and new_idx < self.max_size:
+            return False
+        return True
+
+    def rewind(self, num_to_trim: int) -> bool:
+        if not self.can_rewind(num_to_trim):
+            return False
+
+        if num_to_trim <= 0:
+            return True
+
+        keys = self._temporal_order(self.keys)
+        values = self._temporal_order(self.values)
+        if num_to_trim > keys.shape[2]:
+            return False
+
+        self.offset -= num_to_trim
+        self._idx -= num_to_trim
+        if self.offset < 0 or self._idx < 0:
+            return False
+
+        materialized = min(self._idx, self.offset)
+        self.keys = keys[..., :materialized, :]
+        self.values = values[..., :materialized, :]
+        self._idx = materialized
+        return True
+
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         raise NotImplementedError("RotatingKVCache Quantization NYI")
 
