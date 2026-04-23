@@ -32,7 +32,9 @@ from .models.cache import (
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
+    can_rewind_prompt_cache,
     load_prompt_cache,
+    rewind_prompt_cache,
 )
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
@@ -576,8 +578,16 @@ def speculative_generate_step(
         return y
 
     def _rewind_cache(num_draft, num_accept):
-        cache.trim_prompt_cache(model_cache, num_draft - num_accept)
-        cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+        model_rewind = num_draft - num_accept
+        draft_rewind = max(num_draft - num_accept - 1, 0)
+        if not can_rewind_prompt_cache(model_cache, model_rewind):
+            raise ValueError("Model cache cannot rewind speculative suffix safely.")
+        if not can_rewind_prompt_cache(draft_cache, draft_rewind):
+            raise ValueError("Draft cache cannot rewind speculative suffix safely.")
+        if not rewind_prompt_cache(model_cache, model_rewind):
+            raise ValueError("Model cache rewind failed unexpectedly.")
+        if not rewind_prompt_cache(draft_cache, draft_rewind):
+            raise ValueError("Draft cache rewind failed unexpectedly.")
 
     def _draft_generate(y, num_draft):
         if num_draft == 0:
