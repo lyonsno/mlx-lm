@@ -125,7 +125,12 @@ def _can_rewind_layer_cache(layer_cache, num_to_trim):
             return False
         try:
             return bool(can_rewind(num_to_trim))
-        except Exception:
+        except (
+            AttributeError,
+            NotImplementedError,
+            TypeError,
+            ValueError,
+        ):
             return False
 
     if not callable(is_trimmable) or (not callable(trim) and not callable(rewind)):
@@ -140,7 +145,12 @@ def _can_rewind_layer_cache(layer_cache, num_to_trim):
         if isinstance(offset, numbers.Integral):
             return num_to_trim <= int(offset)
         return True
-    except Exception:
+    except (
+        AttributeError,
+        NotImplementedError,
+        TypeError,
+        ValueError,
+    ):
         return False
 
 
@@ -158,7 +168,12 @@ def _rewind_layer_cache(layer_cache, num_to_trim):
     if callable(rewind):
         try:
             return bool(rewind(num_to_trim))
-        except Exception:
+        except (
+            AttributeError,
+            NotImplementedError,
+            TypeError,
+            ValueError,
+        ):
             return False
 
     is_trimmable = getattr(layer_cache, "is_trimmable", None)
@@ -171,7 +186,12 @@ def _rewind_layer_cache(layer_cache, num_to_trim):
         if num_to_trim <= 0:
             return True
         return trim(num_to_trim) == num_to_trim
-    except Exception:
+    except (
+        AttributeError,
+        NotImplementedError,
+        TypeError,
+        ValueError,
+    ):
         return False
 
 

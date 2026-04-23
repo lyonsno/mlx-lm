@@ -18,8 +18,10 @@ from mlx_lm.models.cache import (
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
+    can_rewind_prompt_cache,
     load_prompt_cache,
     make_prompt_cache,
+    rewind_prompt_cache,
     save_prompt_cache,
     trim_prompt_cache,
 )
@@ -291,6 +293,56 @@ class TestPromptCache(unittest.TestCase):
         self.assertTrue(
             all(mx.allclose(l, l2) for l, l2 in zip(all_logits, second_all_logits))
         )
+
+    def test_can_rewind_prompt_cache_mixed_layers(self):
+        class RewindOnlyLayer:
+            def __init__(self, offset):
+                self.offset = offset
+
+            @property
+            def nbytes(self):
+                return 1
+
+            def is_trimmable(self):
+                return False
+
+            def can_rewind(self, n):
+                return n <= self.offset
+
+            def rewind(self, n):
+                if n > self.offset:
+                    return False
+                self.offset -= n
+                return True
+
+        kv_cache = KVCache()
+        x = mx.random.uniform(shape=(1, 8, 4, 4))
+        kv_cache.update_and_fetch(x, x)
+        cache = [kv_cache, RewindOnlyLayer(offset=4)]
+
+        self.assertTrue(can_rewind_prompt_cache(cache, 3))
+        self.assertFalse(can_rewind_prompt_cache(cache, 5))
+        self.assertTrue(rewind_prompt_cache(cache, 3))
+        self.assertEqual(cache[0].offset, 1)
+        self.assertEqual(cache[1].offset, 1)
+
+    def test_can_rewind_prompt_cache_surfaces_unexpected_errors(self):
+        class BrokenLayer:
+            @property
+            def nbytes(self):
+                return 1
+
+            def is_trimmable(self):
+                return False
+
+            def can_rewind(self, n):
+                raise RuntimeError("broken cache state")
+
+            def rewind(self, n):
+                return True
+
+        with self.assertRaisesRegex(RuntimeError, "broken cache state"):
+            can_rewind_prompt_cache([BrokenLayer()], 1)
 
     def test_cache_copying(self):
         cache = [KVCache()]
