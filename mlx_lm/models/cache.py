@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import numbers
 from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
@@ -109,6 +110,76 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     return [c.trim(num_tokens) for c in cache][0]
 
 
+def _can_rewind_layer_cache(layer_cache, num_to_trim):
+    can_rewind = getattr(layer_cache, "can_rewind", None)
+    rewind = getattr(layer_cache, "rewind", None)
+    is_trimmable = getattr(layer_cache, "is_trimmable", None)
+    trim = getattr(layer_cache, "trim", None)
+    if callable(can_rewind):
+        has_execution_path = callable(rewind) or (
+            callable(is_trimmable) and callable(trim)
+        )
+        if not has_execution_path:
+            return False
+        try:
+            return bool(can_rewind(num_to_trim))
+        except Exception:
+            return False
+
+    if not callable(is_trimmable) or (not callable(trim) and not callable(rewind)):
+        return False
+    try:
+        if not bool(is_trimmable()):
+            return False
+        if num_to_trim <= 0:
+            return True
+
+        offset = getattr(layer_cache, "offset", None)
+        if isinstance(offset, numbers.Integral):
+            return num_to_trim <= int(offset)
+        return True
+    except Exception:
+        return False
+
+
+def can_rewind_prompt_cache(cache: List[Any], num_tokens: int) -> bool:
+    """
+    Check whether every layer in a prompt cache can rewind by ``num_tokens``.
+    """
+    return all(
+        _can_rewind_layer_cache(layer_cache, num_tokens) for layer_cache in cache
+    )
+
+
+def _rewind_layer_cache(layer_cache, num_to_trim):
+    rewind = getattr(layer_cache, "rewind", None)
+    if callable(rewind):
+        try:
+            return bool(rewind(num_to_trim))
+        except Exception:
+            return False
+
+    is_trimmable = getattr(layer_cache, "is_trimmable", None)
+    trim = getattr(layer_cache, "trim", None)
+    if not callable(is_trimmable) or not callable(trim):
+        return False
+    try:
+        if not bool(is_trimmable()):
+            return False
+        if num_to_trim <= 0:
+            return True
+        return trim(num_to_trim) == num_to_trim
+    except Exception:
+        return False
+
+
+def rewind_prompt_cache(cache: List[Any], num_tokens: int) -> bool:
+    """
+    Rewind every layer in a prompt cache by ``num_tokens``.
+    """
+    return all(_rewind_layer_cache(layer_cache, num_tokens) for layer_cache in cache)
+
+
 def create_attention_mask(
     N: int, offset: int, return_array: bool, window_size: Optional[int]
 ):
@@ -143,6 +214,27 @@ class _BaseCache:
 
     def is_trimmable(self):
         return False
+
+    def can_rewind(self, num_to_trim: int) -> bool:
+        if not bool(self.is_trimmable()):
+            return False
+        if num_to_trim <= 0:
+            return True
+
+        offset = getattr(self, "offset", None)
+        if isinstance(offset, numbers.Integral):
+            return num_to_trim <= int(offset)
+        return True
+
+    def rewind(self, num_to_trim: int) -> bool:
+        if not self.can_rewind(num_to_trim):
+            return False
+        if num_to_trim <= 0:
+            return True
+        trim = getattr(self, "trim", None)
+        if not callable(trim):
+            return False
+        return trim(num_to_trim) == num_to_trim
 
     def size(self):
         """
@@ -776,6 +868,14 @@ class CacheList(_BaseCache):
         for c in self.caches:
             m = c.trim(n)
         return m
+
+    def can_rewind(self, num_to_trim: int) -> bool:
+        return all(c.can_rewind(num_to_trim) for c in self.caches)
+
+    def rewind(self, num_to_trim: int) -> bool:
+        if not self.can_rewind(num_to_trim):
+            return False
+        return all(c.rewind(num_to_trim) for c in self.caches)
 
     @property
     def state(self):

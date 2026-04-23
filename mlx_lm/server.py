@@ -36,8 +36,10 @@ from huggingface_hub import scan_cache_dir
 from ._version import __version__
 from .generate import BatchGenerator, generation_stream, stream_generate
 from .models.cache import (
+    can_rewind_prompt_cache,
     can_trim_prompt_cache,
     make_prompt_cache,
+    rewind_prompt_cache,
     trim_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
@@ -299,10 +301,14 @@ class LRUPromptCache:
 
         if result.longer is not None:
             cache_entry = self._get(result.model, result.longer)
-            if can_trim_prompt_cache(cache_entry.prompt_cache):
+            prefix = min(len(tokens) - 1, result.common_prefix)
+            num_to_trim = len(result.longer) - prefix
+            if can_rewind_prompt_cache(cache_entry.prompt_cache, num_to_trim):
                 cache = copy.deepcopy(cache_entry.prompt_cache)
-                prefix = min(len(tokens) - 1, result.common_prefix)
-                num_to_trim = len(result.longer) - prefix
+                if rewind_prompt_cache(cache, num_to_trim):
+                    return cache, tokens[prefix:]
+            elif can_trim_prompt_cache(cache_entry.prompt_cache):
+                cache = copy.deepcopy(cache_entry.prompt_cache)
                 trim_prompt_cache(cache, num_to_trim)
                 return cache, tokens[prefix:]
 
