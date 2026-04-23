@@ -5,12 +5,24 @@ import io
 import json
 import threading
 import unittest
+from queue import Queue
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import mlx.core as mx
 import requests
 
-from mlx_lm.models.cache import KVCache
-from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
+from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.server import (
+    APIHandler,
+    CompletionRequest,
+    GenerationArguments,
+    LogitsProcessorArguments,
+    LRUPromptCache,
+    ModelDescription,
+    ResponseGenerator,
+    SamplingArguments,
+)
 from mlx_lm.utils import load
 
 
@@ -570,6 +582,204 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(exact_remaining, [])
         self.assertEqual(exact_cache[0].offset, len(long_tokens))
         self.assertEqual(exact_cache[1].offset, len(long_tokens))
+
+    def test_rotating_cache_longer_hit_reuses_chunked_prefill_boundary(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("rotating-chunked", None, None)
+        long_tokens = list(range(12))
+        shorter_tokens = long_tokens[:10]
+
+        kv = mx.arange(12, dtype=mx.float32).reshape(1, 1, 12, 1)
+        long_cache = RotatingKVCache(max_size=4)
+        long_cache.update_and_fetch(kv[..., :8, :], kv[..., :8, :])
+        long_cache.update_and_fetch(kv[..., 8:, :], kv[..., 8:, :])
+        cache.insert_cache(model, long_tokens, [long_cache])
+
+        reused_cache, remaining = cache.fetch_nearest_cache(model, shorter_tokens)
+        self.assertIsNotNone(reused_cache)
+        self.assertEqual(remaining, shorter_tokens[-1:])
+
+        baseline = RotatingKVCache(max_size=4)
+        baseline.update_and_fetch(kv[..., :8, :], kv[..., :8, :])
+        baseline.update_and_fetch(kv[..., 8:9, :], kv[..., 8:9, :])
+        self.assertEqual(reused_cache[0].offset, baseline.offset)
+        self.assertTrue(
+            mx.array_equal(
+                reused_cache[0]._temporal_order(reused_cache[0].keys),
+                baseline._temporal_order(baseline.keys),
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(
+                reused_cache[0]._temporal_order(reused_cache[0].values),
+                baseline._temporal_order(baseline.values),
+            )
+        )
+
+        exact_cache, exact_remaining = cache.fetch_nearest_cache(model, long_tokens)
+        self.assertIsNotNone(exact_cache)
+        self.assertEqual(exact_remaining, [])
+        self.assertEqual(exact_cache[0].offset, len(long_tokens))
+
+    def test_rotating_cache_longer_hit_misses_when_prefix_fell_out_of_window(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("rotating-rolling", None, None)
+        long_tokens = list(range(6))
+        shorter_tokens = long_tokens[:5]
+
+        kv = mx.arange(6, dtype=mx.float32).reshape(1, 1, 6, 1)
+        long_cache = RotatingKVCache(max_size=4)
+        for i in range(6):
+            tok = kv[..., i : i + 1, :]
+            long_cache.update_and_fetch(tok, tok)
+        cache.insert_cache(model, long_tokens, [long_cache])
+
+        reused_cache, remaining = cache.fetch_nearest_cache(model, shorter_tokens)
+        self.assertIsNone(reused_cache)
+        self.assertEqual(remaining, shorter_tokens)
+
+
+class TestPromptBoundaryCapture(unittest.TestCase):
+    def setUp(self):
+        self.model_provider = DummyModelProvider()
+        self.prompt_cache = LRUPromptCache()
+        self.response_generator = ResponseGenerator(
+            self.model_provider, self.prompt_cache
+        )
+
+    def tearDown(self):
+        self.response_generator.stop_and_join()
+
+    def _make_args(self):
+        return GenerationArguments(
+            model=ModelDescription(
+                model="default_model",
+                draft="default_model",
+                adapter=None,
+            ),
+            sampling=SamplingArguments(
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                min_p=0.0,
+                xtc_probability=0.0,
+                xtc_threshold=0.0,
+            ),
+            logits=LogitsProcessorArguments(
+                logit_bias=None,
+                repetition_penalty=1.0,
+                repetition_context_size=20,
+            ),
+            stop_words=[],
+            max_tokens=1,
+            num_draft_tokens=1,
+            logprobs=False,
+            top_logprobs=0,
+            seed=None,
+            chat_template_kwargs=None,
+        )
+
+    def test_serve_single_inserts_prompt_boundary_before_completion_cache(self):
+        prompt = [1, 2, 3]
+        boundary_cache = ["boundary-cache"]
+        live_cache = ["live-cache"]
+        rqueue = Queue()
+        args = self._make_args()
+        request = CompletionRequest(
+            request_type="text",
+            prompt="hello",
+            messages=[],
+            tools=None,
+            role_mapping=None,
+        )
+
+        self.response_generator._tokenize = lambda tokenizer, request, args: prompt
+        self.prompt_cache.fetch_nearest_cache = Mock(return_value=(live_cache, prompt))
+        self.prompt_cache.insert_cache = Mock()
+
+        def fake_stream_generate(*args, **kwargs):
+            kwargs["prompt_cache_capture_callback"](boundary_cache)
+            yield SimpleNamespace(
+                text="x",
+                token=99,
+                logprobs=mx.zeros((4,), dtype=mx.float32),
+                finish_reason="stop",
+            )
+
+        with patch("mlx_lm.server.stream_generate", fake_stream_generate):
+            self.response_generator._serve_single((rqueue, request, args))
+
+        insert_calls = self.prompt_cache.insert_cache.call_args_list
+        self.assertEqual(len(insert_calls), 2)
+        self.assertEqual(insert_calls[0].args[1], prompt)
+        self.assertIs(insert_calls[0].args[2], boundary_cache)
+        self.assertEqual(insert_calls[1].args[1], prompt + [99])
+        self.assertIs(insert_calls[1].args[2], live_cache)
+
+    def test_batch_path_inserts_prompt_boundary_before_completion_cache(self):
+        prompt = [1, 2, 3]
+        boundary_cache = ["boundary-cache"]
+        live_cache = ["live-cache"]
+        args = self._make_args()
+        request = CompletionRequest(
+            request_type="text",
+            prompt="hello",
+            messages=[],
+            tools=None,
+            role_mapping=None,
+        )
+
+        self.response_generator._tokenize = lambda tokenizer, request, args: prompt
+        self.prompt_cache.fetch_nearest_cache = Mock(return_value=(live_cache, prompt))
+        self.prompt_cache.insert_cache = Mock()
+
+        class FakeBatchGenerator:
+            def __init__(self, *args, prompt_cache_capture_callback=None, **kwargs):
+                self.prompt_cache_capture_callback = prompt_cache_capture_callback
+                self.prompt_cache_nbytes = 0
+                self._done = False
+
+            def insert(
+                self,
+                prompts,
+                max_tokens=None,
+                caches=None,
+                samplers=None,
+                logits_processors=None,
+            ):
+                return [7]
+
+            def next(self):
+                if self._done:
+                    return []
+                self._done = True
+                self.prompt_cache_capture_callback([(7, boundary_cache)])
+                return [
+                    SimpleNamespace(
+                        uid=7,
+                        token=99,
+                        logprobs=mx.zeros((4,), dtype=mx.float32),
+                        finish_reason="length",
+                        prompt_cache=live_cache,
+                    )
+                ]
+
+            def close(self):
+                return None
+
+            def remove(self, uids, return_prompt_caches=False):
+                return {}
+
+        with patch("mlx_lm.server.BatchGenerator", FakeBatchGenerator):
+            ctx, responses = self.response_generator.generate(request, args)
+            list(responses)
+
+        insert_calls = self.prompt_cache.insert_cache.call_args_list
+        self.assertEqual(len(insert_calls), 2)
+        self.assertEqual(insert_calls[0].args[1], prompt)
+        self.assertIs(insert_calls[0].args[2], boundary_cache)
+        self.assertEqual(insert_calls[1].args[1], prompt + [99])
+        self.assertIs(insert_calls[1].args[2], live_cache)
 
 
 if __name__ == "__main__":

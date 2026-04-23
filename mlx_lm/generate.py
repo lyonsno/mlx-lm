@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import copy
 import functools
 import json
 import sys
@@ -316,6 +317,7 @@ def generate_step(
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+    prompt_cache_capture_callback: Optional[Callable[[List[Any]], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -343,6 +345,10 @@ def generate_step(
            when ``kv_bits`` is non-None. Default: ``0``.
         prompt_progress_callback (Callable[[int, int], None]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
+        prompt_cache_capture_callback (Callable[[List[Any]], None], optional): A
+          callback invoked once after the full prompt boundary has been
+          materialized in the cache and before generation advances beyond it.
+          The callback receives an owned snapshot of that prompt-boundary cache.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
 
@@ -449,6 +455,8 @@ def generate_step(
             mx.clear_cache()
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
+        if prompt_cache_capture_callback is not None:
+            prompt_cache_capture_callback(copy.deepcopy(prompt_cache))
 
     mx.async_eval(y, logprobs)
     n = 0
@@ -482,6 +490,7 @@ def speculative_generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    prompt_cache_capture_callback: Optional[Callable[[List[Any]], None]] = None,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -507,6 +516,11 @@ def speculative_generate_step(
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
+        prompt_cache_capture_callback (Callable[[List[Any]], None], optional): A
+          callback invoked once after the prompt boundary can be reconstructed
+          for both model and draft caches and before generation advances
+          further. The callback receives an owned snapshot of that combined
+          prompt-boundary cache.
 
     Yields:
         Tuple[mx.array, mx.array, bool]: One token, a vector of log probabilities,
@@ -599,6 +613,29 @@ def speculative_generate_step(
             ys.append(y)
         return mx.concatenate(ys)
 
+    def _capture_prompt_boundary(num_draft):
+        if prompt_cache_capture_callback is None:
+            return
+
+        model_boundary = copy.deepcopy(model_cache)
+        draft_boundary = copy.deepcopy(draft_cache)
+        draft_rewind = max(num_draft - 1, 0)
+
+        if not can_rewind_prompt_cache(model_boundary, num_draft):
+            raise ValueError(
+                "Model cache cannot capture speculative prompt boundary safely."
+            )
+        if not can_rewind_prompt_cache(draft_boundary, draft_rewind):
+            raise ValueError(
+                "Draft cache cannot capture speculative prompt boundary safely."
+            )
+        if not rewind_prompt_cache(model_boundary, num_draft):
+            raise ValueError("Model cache prompt-boundary capture failed unexpectedly.")
+        if not rewind_prompt_cache(draft_boundary, draft_rewind):
+            raise ValueError("Draft cache prompt-boundary capture failed unexpectedly.")
+
+        prompt_cache_capture_callback(model_boundary + draft_boundary)
+
     with mx.stream(generation_stream):
         draft_y = _prefill(draft_model, draft_cache, y)
         y = _prefill(model, model_cache, y)
@@ -607,6 +644,7 @@ def speculative_generate_step(
     # Set these so the finally block doesn't raise
     num_draft = 0
     n = 0
+    captured_prompt_boundary = False
     try:
         while True:
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
@@ -615,6 +653,9 @@ def speculative_generate_step(
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
             y = mx.concatenate([y, draft_tokens])
             tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
+            if not captured_prompt_boundary:
+                _capture_prompt_boundary(num_draft)
+                captured_prompt_boundary = True
             mx.eval(tokens, draft_tokens)
             draft_tokens = draft_tokens.tolist()
             tokens = tokens.tolist()
@@ -961,6 +1002,9 @@ class BatchGenerator:
         prompt_progress_callback: Optional[
             Callable[[List[Tuple[int, int, int]]], None]
         ] = None,
+        prompt_cache_capture_callback: Optional[
+            Callable[[List[Tuple[int, List[Any]]]], None]
+        ] = None,
         max_kv_size: Optional[int] = None,
     ):
         self.model = model
@@ -974,6 +1018,9 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
+        self.prompt_cache_capture_callback = prompt_cache_capture_callback or (
+            lambda *_: None
+        )
         self._stats = BatchStats()
         self._next_count = 0
         self.max_kv_size = max_kv_size
@@ -1214,6 +1261,9 @@ class BatchGenerator:
                 tic = time.perf_counter()
 
             batch = self._process_prompts(prompts)
+            self.prompt_cache_capture_callback(
+                [(uid, batch.extract_cache(i)) for i, uid in enumerate(batch.uids)]
+            )
             self.unprocessed_prompts = self.unprocessed_prompts[
                 self.prefill_batch_size :
             ]

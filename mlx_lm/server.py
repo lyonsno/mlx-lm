@@ -750,6 +750,18 @@ class ResponseGenerator:
                 if uid in batch_results:
                     batch_results[uid]["rqueue"].put((min(processed, total), total))
 
+        def prompt_boundary_callback(entries):
+            for uid, prompt_cache in entries:
+                if uid not in batch_results:
+                    continue
+                result = batch_results[uid]
+                if not result.get("capture_prompt_boundary", False):
+                    continue
+                self.prompt_cache.insert_cache(
+                    current_model_key, result["prompt_key"], prompt_cache
+                )
+                result["capture_prompt_boundary"] = False
+
         if self._is_distributed:
             seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
             mx.random.seed(seed)
@@ -802,6 +814,7 @@ class ResponseGenerator:
                         current_model_key, prompt
                     )
                     ctx.prompt_cache_count = len(prompt) - len(rest)
+                    prompt_key = prompt[:]
                     if cache is None:
                         cache = make_prompt_cache(self.model_provider.model)
 
@@ -820,6 +833,8 @@ class ResponseGenerator:
                     batch_results[uid] = {
                         "ctx": ctx,
                         "cache_key": prompt[:],
+                        "prompt_key": prompt_key,
+                        "capture_prompt_boundary": len(rest) > 0,
                         "rqueue": rqueue,
                         "detokenizer": tokenizer.detokenizer,
                     }
@@ -858,6 +873,7 @@ class ResponseGenerator:
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prompt_progress_callback=progress_callback,
+                        prompt_cache_capture_callback=prompt_boundary_callback,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -979,6 +995,7 @@ class ResponseGenerator:
                 self.model_provider.model_key, prompt
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
+            prompt_key = prompt[:]
             cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
@@ -987,6 +1004,17 @@ class ResponseGenerator:
 
             ncaches, nbytes = len(self.prompt_cache), self.prompt_cache.nbytes
             logging.info(f"We have {ncaches} kv caches that take {nbytes/1e9:.2f} GB")
+
+            capture_prompt_boundary = len(rest) > 0
+
+            def on_prompt_boundary(prompt_boundary_cache):
+                nonlocal capture_prompt_boundary
+                if not capture_prompt_boundary:
+                    return
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key, prompt_key, prompt_boundary_cache
+                )
+                capture_prompt_boundary = False
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -1000,6 +1028,7 @@ class ResponseGenerator:
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
+                prompt_cache_capture_callback=on_prompt_boundary,
             ):
                 rqueue.put(
                     Response(
