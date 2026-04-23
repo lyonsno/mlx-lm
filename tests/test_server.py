@@ -157,6 +157,37 @@ class TestProcessControlTokens(unittest.TestCase):
         )
 
 
+class RewindOnlyLayer:
+    def __init__(self, offset):
+        self.offset = offset
+        self.can_rewind_calls = []
+        self.rewind_calls = []
+
+    @property
+    def nbytes(self):
+        return 1
+
+    def is_trimmable(self):
+        return False
+
+    def can_rewind(self, n):
+        self.can_rewind_calls.append(n)
+        return n <= self.offset
+
+    def rewind(self, n):
+        self.rewind_calls.append(n)
+        if n > self.offset:
+            return False
+        self.offset -= n
+        return True
+
+    def __deepcopy__(self, memo):
+        clone = type(self)(self.offset)
+        clone.can_rewind_calls = list(self.can_rewind_calls)
+        clone.rewind_calls = list(self.rewind_calls)
+        return clone
+
+
 class TestServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -684,6 +715,35 @@ class TestLRUPromptCache(unittest.TestCase):
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
+
+    def test_mixed_cache_longer_hit_reuses_rewindable_non_trimmable_layer(self):
+        cache = LRUPromptCache(max_size=10)
+
+        def get_kv(n):
+            keys = mx.arange(n).reshape(1, 1, n, 1)
+            return keys, keys
+
+        model = ("mixed-rewindable", None, None)
+        long_tokens = [1, 2, 3, 4]
+        shorter_tokens = [1, 2]
+
+        kv_cache = KVCache()
+        kv_cache.update_and_fetch(*get_kv(len(long_tokens)))
+        rewind_only = RewindOnlyLayer(offset=len(long_tokens))
+        cache.insert_cache(model, long_tokens, [kv_cache, rewind_only])
+
+        reused_cache, remaining = cache.fetch_nearest_cache(model, shorter_tokens)
+
+        self.assertIsNotNone(reused_cache)
+        self.assertEqual(remaining, shorter_tokens[-1:])
+        self.assertEqual(reused_cache[0].offset, 1)
+        self.assertEqual(reused_cache[1].offset, 1)
+
+        exact_cache, exact_remaining = cache.fetch_nearest_cache(model, long_tokens)
+        self.assertIsNotNone(exact_cache)
+        self.assertEqual(exact_remaining, [])
+        self.assertEqual(exact_cache[0].offset, len(long_tokens))
+        self.assertEqual(exact_cache[1].offset, len(long_tokens))
 
 
 if __name__ == "__main__":

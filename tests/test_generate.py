@@ -13,6 +13,7 @@ from mlx_lm.generate import (
     batch_generate,
     generate,
     generate_step,
+    speculative_generate_step,
     stream_generate,
 )
 from mlx_lm.models.cache import KVCache, RotatingKVCache
@@ -115,6 +116,61 @@ class TestGenerate(unittest.TestCase):
         # first 2 generations should be drafts, the third should come
         # from the target model, and last two should be drafts
         self.assertEqual(drafted, [True, True, False, True, True])
+
+    def test_speculative_rewind_uses_recoverable_non_trimmable_cache(self):
+        class RewindOnlyLayer:
+            def __init__(self, offset):
+                self.offset = offset
+
+            @property
+            def nbytes(self):
+                return 1
+
+            def is_trimmable(self):
+                return False
+
+            def can_rewind(self, n):
+                return n <= self.offset
+
+            def rewind(self, n):
+                if n > self.offset:
+                    return False
+                self.offset -= n
+                return True
+
+        class FakeModel:
+            def __init__(self, token):
+                self.token = token
+                self.layers = [object()]
+
+            def __call__(self, y, cache=None):
+                vocab = 4
+                logits = mx.zeros((1, y.shape[1], vocab), dtype=mx.float32)
+                logits[:, :, self.token] = 1.0
+                return logits
+
+        prompt = mx.array([0], dtype=mx.uint32)
+        model = FakeModel(token=2)
+        draft_model = FakeModel(token=1)
+        model_cache = RewindOnlyLayer(offset=2)
+        draft_cache = RewindOnlyLayer(offset=2)
+        prompt_cache = [model_cache, draft_cache]
+
+        results = list(
+            speculative_generate_step(
+                prompt,
+                model,
+                draft_model,
+                prompt_cache=prompt_cache,
+                num_draft_tokens=1,
+                max_tokens=1,
+            )
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0][2])
+        self.assertEqual(model_cache.offset, 1)
+        self.assertEqual(draft_cache.offset, 2)
 
     def test_stream_generate_input_embeddings(self):
         sampler = make_sampler(temp=0.0)  # determinate sampler
