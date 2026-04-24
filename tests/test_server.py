@@ -842,6 +842,10 @@ class TestPromptBoundaryCapture(unittest.TestCase):
                 logit_bias=None,
                 repetition_penalty=1.0,
                 repetition_context_size=20,
+                presence_penalty=0.0,
+                presence_context_size=20,
+                frequency_penalty=0.0,
+                frequency_context_size=20,
             ),
             stop_words=[],
             max_tokens=1,
@@ -866,7 +870,12 @@ class TestPromptBoundaryCapture(unittest.TestCase):
             role_mapping=None,
         )
 
-        self.response_generator._tokenize = lambda tokenizer, request, args: prompt
+        self.response_generator._tokenize = lambda tokenizer, request, args: (
+            prompt,
+            [prompt[:-1], prompt[-1:]],
+            [],
+            "normal",
+        )
         self.prompt_cache.fetch_nearest_cache = Mock(return_value=(live_cache, prompt))
         self.prompt_cache.insert_cache = Mock()
 
@@ -902,7 +911,12 @@ class TestPromptBoundaryCapture(unittest.TestCase):
             role_mapping=None,
         )
 
-        self.response_generator._tokenize = lambda tokenizer, request, args: prompt
+        self.response_generator._tokenize = lambda tokenizer, request, args: (
+            prompt,
+            [prompt[:-1], prompt[-1:]],
+            [],
+            "normal",
+        )
         self.prompt_cache.fetch_nearest_cache = Mock(return_value=(live_cache, prompt))
         self.prompt_cache.insert_cache = Mock()
 
@@ -912,34 +926,42 @@ class TestPromptBoundaryCapture(unittest.TestCase):
                 self.prompt_cache_nbytes = 0
                 self._done = False
 
-            def insert(
+            def insert_segments(
                 self,
-                prompts,
+                segments,
                 max_tokens=None,
                 caches=None,
+                all_tokens=None,
                 capture_prompt_boundaries=None,
                 samplers=None,
                 logits_processors=None,
+                state_machines=None,
             ):
                 return [7]
 
             def next(self):
                 if self._done:
-                    return []
+                    return [], []
                 self._done = True
                 self.prompt_cache_capture_callback([(7, boundary_cache)])
-                return [
+                return [], [
                     SimpleNamespace(
                         uid=7,
                         token=99,
+                        current_state="normal",
+                        match_sequence=None,
                         logprobs=mx.zeros((4,), dtype=mx.float32),
                         finish_reason="length",
+                        all_tokens=prompt + [99],
                         prompt_cache=live_cache,
                     )
                 ]
 
             def close(self):
                 return None
+
+            def extract_cache(self, uids):
+                return {}
 
             def remove(self, uids, return_prompt_caches=False):
                 return {}
@@ -961,7 +983,7 @@ class TestPromptBoundaryCapture(unittest.TestCase):
         prompt = [1, 2, 3]
         completion_key = prompt + [99]
         boundary_cache = [MockCache("boundary-cache")]
-        live_cache = [MockCache("live-cache")]
+        live_cache = [MockCache("live-cache", is_trimmable=False)]
         args = self._make_args()
         rqueue = Queue()
         request = CompletionRequest(
@@ -985,7 +1007,12 @@ class TestPromptBoundaryCapture(unittest.TestCase):
         self.assertIsNone(baseline_reused)
         self.assertEqual(baseline_remaining, prompt)
 
-        self.response_generator._tokenize = lambda tokenizer, request, args: prompt
+        self.response_generator._tokenize = lambda tokenizer, request, args: (
+            prompt,
+            [prompt[:-1], prompt[-1:]],
+            [],
+            "normal",
+        )
 
         def fake_stream_generate(*args, **kwargs):
             kwargs["prompt_cache_capture_callback"](boundary_cache)
@@ -1020,7 +1047,7 @@ class TestPromptBoundaryCapture(unittest.TestCase):
         prompt = [1, 2, 3]
         completion_key = prompt + [99]
         boundary_cache = [MockCache("boundary-cache")]
-        live_cache = [MockCache("live-cache")]
+        live_cache = [MockCache("live-cache", is_trimmable=False)]
         args = self._make_args()
         request = CompletionRequest(
             request_type="text",
@@ -1043,7 +1070,12 @@ class TestPromptBoundaryCapture(unittest.TestCase):
         self.assertIsNone(baseline_reused)
         self.assertEqual(baseline_remaining, prompt)
 
-        self.response_generator._tokenize = lambda tokenizer, request, args: prompt
+        self.response_generator._tokenize = lambda tokenizer, request, args: (
+            prompt,
+            [prompt[:-1], prompt[-1:]],
+            [],
+            "normal",
+        )
 
         class FakeBatchGenerator:
             def __init__(self, *args, prompt_cache_capture_callback=None, **kwargs):
@@ -1051,34 +1083,42 @@ class TestPromptBoundaryCapture(unittest.TestCase):
                 self.prompt_cache_nbytes = 0
                 self._done = False
 
-            def insert(
+            def insert_segments(
                 self,
-                prompts,
+                segments,
                 max_tokens=None,
                 caches=None,
+                all_tokens=None,
                 capture_prompt_boundaries=None,
                 samplers=None,
                 logits_processors=None,
+                state_machines=None,
             ):
                 return [7]
 
             def next(self):
                 if self._done:
-                    return []
+                    return [], []
                 self._done = True
                 self.prompt_cache_capture_callback([(7, boundary_cache)])
-                return [
+                return [], [
                     SimpleNamespace(
                         uid=7,
                         token=99,
+                        current_state="normal",
+                        match_sequence=None,
                         logprobs=mx.zeros((4,), dtype=mx.float32),
                         finish_reason="length",
+                        all_tokens=prompt + [99],
                         prompt_cache=live_cache,
                     )
                 ]
 
             def close(self):
                 return None
+
+            def extract_cache(self, uids):
+                return {}
 
             def remove(self, uids, return_prompt_caches=False):
                 return {}

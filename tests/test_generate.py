@@ -118,7 +118,7 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(drafted, [True, True, False, True, True])
 
     def test_generate_step_prompt_boundary_callback_captures_owned_prompt_cache(self):
-        prompt = self.tokenizer.encode("hello")
+        prompt = self.tokenizer.encode("hello world")
         prompt_cache = make_prompt_cache(self.model)
         captured = []
 
@@ -140,7 +140,7 @@ class TestGenerate(unittest.TestCase):
         self.assertTrue(all(c.offset > len(prompt) for c in prompt_cache))
 
     def test_batch_generator_prompt_boundary_callback_captures_prompt_boundary(self):
-        prompt = self.tokenizer.encode("hello")
+        prompt = self.tokenizer.encode("hello world")
         captured = {}
 
         def on_prompt_boundary(entries):
@@ -154,10 +154,10 @@ class TestGenerate(unittest.TestCase):
         )
         (uid,) = batch_gen.insert([prompt], capture_prompt_boundaries=[True])
 
-        responses = batch_gen.next()
+        responses = batch_gen.next_generated()
         self.assertEqual(len(responses), 1)
         self.assertIn(uid, captured)
-        self.assertTrue(all(c.offset == len(prompt) for c in captured[uid]))
+        self.assertTrue(all(c.offset == len(prompt) - 1 for c in captured[uid]))
         self.assertTrue(all(c.offset > len(prompt) for c in responses[0].prompt_cache))
 
     def test_batch_generator_skips_prompt_boundary_capture_when_not_requested(self):
@@ -174,7 +174,7 @@ class TestGenerate(unittest.TestCase):
         )
         batch_gen.insert([prompt], capture_prompt_boundaries=[False])
 
-        responses = batch_gen.next()
+        responses = batch_gen.next_generated()
         self.assertEqual(len(responses), 1)
         self.assertEqual(captured, [])
 

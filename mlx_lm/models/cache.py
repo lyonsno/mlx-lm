@@ -1846,10 +1846,14 @@ class LRUPromptCache:
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
-            if can_trim_prompt_cache(cache_entry.prompt_cache):
+            prefix = min(len(tokens) - 1, result.common_prefix)
+            num_to_trim = len(result.longer) - prefix
+            if can_rewind_prompt_cache(cache_entry.prompt_cache, num_to_trim):
                 cache = copy.deepcopy(cache_entry.prompt_cache)
-                prefix = min(len(tokens) - 1, result.common_prefix)
-                num_to_trim = len(result.longer) - prefix
+                if rewind_prompt_cache(cache, num_to_trim):
+                    return cache, tokens[prefix:]
+            elif can_trim_prompt_cache(cache_entry.prompt_cache):
+                cache = copy.deepcopy(cache_entry.prompt_cache)
                 trim_prompt_cache(cache, num_to_trim)
                 return cache, tokens[prefix:]
 

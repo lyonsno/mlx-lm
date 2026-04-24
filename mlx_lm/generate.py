@@ -541,10 +541,25 @@ def speculative_generate_step(
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
 
-    if not cache.can_trim_prompt_cache(model_cache):
-        types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
+    if not can_rewind_prompt_cache(model_cache, 0):
+        types = {
+            type(c).__name__
+            for c in model_cache
+            if not cache._can_rewind_layer_cache(c, 0)
+        }
         raise ValueError(
-            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
+            f"Speculative decoding requires a rewind-safe prompt cache "
+            f"(got {types})."
+        )
+    if not can_rewind_prompt_cache(draft_cache, 0):
+        types = {
+            type(c).__name__
+            for c in draft_cache
+            if not cache._can_rewind_layer_cache(c, 0)
+        }
+        raise ValueError(
+            f"Speculative decoding requires a rewind-safe draft cache "
+            f"(got {types})."
         )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -1872,17 +1887,18 @@ class BatchGenerator:
         if split:
             last_inputs = [self._currently_processing[i][0][0] for i in split]
             progress = [(self._currently_processing[i][2],) * 2 for i in split]
-            capture_entries = []
-            for current_idx in split:
-                if self._currently_processing[current_idx][3]:
-                    capture_entries.append(
-                        (
-                            self._prompt_batch.uids[current_idx],
-                            self._prompt_batch.extract_cache(current_idx),
-                        )
-                    )
+            capture_positions = [
+                position
+                for position, current_idx in enumerate(split)
+                if self._currently_processing[current_idx][3]
+            ]
             self._currently_processing = [self._currently_processing[i] for i in keep]
             boundary_batch = self._prompt_batch.split(split)
+            capture_entries = [
+                (uid, boundary_batch.extract_cache(i))
+                for i, uid in enumerate(boundary_batch.uids)
+                if i in capture_positions
+            ]
             if capture_entries:
                 self.prompt_cache_capture_callback(capture_entries)
             gen_batch = boundary_batch.generate(last_inputs)
