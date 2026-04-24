@@ -843,6 +843,93 @@ class TestPromptBoundaryCapture(unittest.TestCase):
         self.assertEqual(reused_cache, boundary_cache)
         self.assertEqual(remaining, [])
 
+    def test_batch_boundary_capture_restores_prompt_when_completion_cache_cannot(
+        self,
+    ):
+        prompt = [1, 2, 3]
+        completion_key = prompt + [99]
+        boundary_cache = [MockCache("boundary-cache")]
+        live_cache = [MockCache("live-cache")]
+        args = self._make_args()
+        request = CompletionRequest(
+            request_type="text",
+            prompt="hello",
+            messages=[],
+            tools=None,
+            role_mapping=None,
+        )
+
+        baseline_cache = LRUPromptCache()
+        baseline_cache.insert_cache(
+            self.model_provider.model_key,
+            completion_key,
+            live_cache,
+        )
+        baseline_reused, baseline_remaining = baseline_cache.fetch_nearest_cache(
+            self.model_provider.model_key,
+            prompt,
+        )
+        self.assertIsNone(baseline_reused)
+        self.assertEqual(baseline_remaining, prompt)
+
+        self.response_generator._tokenize = lambda tokenizer, request, args: prompt
+
+        class FakeBatchGenerator:
+            def __init__(self, *args, prompt_cache_capture_callback=None, **kwargs):
+                self.prompt_cache_capture_callback = prompt_cache_capture_callback
+                self.prompt_cache_nbytes = 0
+                self._done = False
+
+            def insert(
+                self,
+                prompts,
+                max_tokens=None,
+                caches=None,
+                capture_prompt_boundaries=None,
+                samplers=None,
+                logits_processors=None,
+            ):
+                return [7]
+
+            def next(self):
+                if self._done:
+                    return []
+                self._done = True
+                self.prompt_cache_capture_callback([(7, boundary_cache)])
+                return [
+                    SimpleNamespace(
+                        uid=7,
+                        token=99,
+                        logprobs=mx.zeros((4,), dtype=mx.float32),
+                        finish_reason="length",
+                        prompt_cache=live_cache,
+                    )
+                ]
+
+            def close(self):
+                return None
+
+            def remove(self, uids, return_prompt_caches=False):
+                return {}
+
+        with (
+            patch.object(
+                self.prompt_cache,
+                "fetch_nearest_cache",
+                return_value=(live_cache, prompt),
+            ),
+            patch("mlx_lm.server.BatchGenerator", FakeBatchGenerator),
+        ):
+            ctx, responses = self.response_generator.generate(request, args)
+            list(responses)
+
+        reused_cache, remaining = self.prompt_cache.fetch_nearest_cache(
+            self.model_provider.model_key,
+            prompt,
+        )
+        self.assertEqual(reused_cache, boundary_cache)
+        self.assertEqual(remaining, [])
+
 
 if __name__ == "__main__":
     unittest.main()
