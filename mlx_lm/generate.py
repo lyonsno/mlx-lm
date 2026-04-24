@@ -691,7 +691,8 @@ def speculative_generate_step(
                 prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
             _rewind_cache(num_draft, n)
     finally:
-        _rewind_cache(num_draft, n)
+        if captured_prompt_boundary:
+            _rewind_cache(num_draft, n)
 
 
 def stream_generate(
@@ -897,6 +898,7 @@ class Batch:
     logprobs: mx.array
     max_tokens: List[int]
     num_tokens: List[int]
+    capture_prompt_boundaries: List[bool]
     cache: List[Any]
     samplers: List[Any]
     logits_processors: List[Any]
@@ -910,6 +912,9 @@ class Batch:
         self.logprobs = [self.logprobs[k] for k in keep_idx]
         self.max_tokens = [self.max_tokens[k] for k in keep_idx]
         self.num_tokens = [self.num_tokens[k] for k in keep_idx]
+        self.capture_prompt_boundaries = [
+            self.capture_prompt_boundaries[k] for k in keep_idx
+        ]
         self.samplers = [self.samplers[k] for k in keep_idx]
         self.logits_processors = [self.logits_processors[k] for k in keep_idx]
         self.tokens = [self.tokens[k] for k in keep_idx]
@@ -924,6 +929,7 @@ class Batch:
         self.logprobs.extend(other.logprobs)
         self.num_tokens.extend(other.num_tokens)
         self.max_tokens.extend(other.max_tokens)
+        self.capture_prompt_boundaries.extend(other.capture_prompt_boundaries)
         self.samplers.extend(other.samplers)
         self.logits_processors.extend(other.logits_processors)
         self.tokens.extend(other.tokens)
@@ -1048,6 +1054,7 @@ class BatchGenerator:
         prompts,
         max_tokens: Union[List[int], int, None] = None,
         caches=None,
+        capture_prompt_boundaries: list | None = None,
         samplers: list | None = None,
         logits_processors: list | None = None,
     ):
@@ -1062,13 +1069,21 @@ class BatchGenerator:
             if caches[i] is None:
                 caches[i] = cache.make_prompt_cache(self.model)
 
+        capture_prompt_boundaries = capture_prompt_boundaries or [False] * len(prompts)
         samplers = samplers or [None] * len(prompts)
         logits_processors = logits_processors or [self.logits_processors] * len(prompts)
 
-        for p, m, c, s, lp in zip(
-            prompts, max_tokens, caches, samplers, logits_processors
+        for p, m, c, capture_boundary, s, lp in zip(
+            prompts,
+            max_tokens,
+            caches,
+            capture_prompt_boundaries,
+            samplers,
+            logits_processors,
         ):
-            self.unprocessed_prompts.append((self.uid_count, p, m, c, s, lp))
+            self.unprocessed_prompts.append(
+                (self.uid_count, p, m, c, capture_boundary, s, lp)
+            )
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
@@ -1109,7 +1124,15 @@ class BatchGenerator:
         return total
 
     def _process_prompts(self, prompts):
-        uids, inputs, max_tokens, caches, samplers, logits_processors = zip(*prompts)
+        (
+            uids,
+            inputs,
+            max_tokens,
+            caches,
+            capture_prompt_boundaries,
+            samplers,
+            logits_processors,
+        ) = zip(*prompts)
 
         lengths = [len(p) for p in inputs]
         max_length = max(lengths)
@@ -1188,6 +1211,7 @@ class BatchGenerator:
             logprobs,
             list(max_tokens),
             [0] * len(uids),
+            list(capture_prompt_boundaries),
             prompt_cache,
             list(samplers),
             list(logits_processors),
@@ -1261,9 +1285,15 @@ class BatchGenerator:
                 tic = time.perf_counter()
 
             batch = self._process_prompts(prompts)
-            self.prompt_cache_capture_callback(
-                [(uid, batch.extract_cache(i)) for i, uid in enumerate(batch.uids)]
-            )
+            capture_entries = [
+                (uid, batch.extract_cache(i))
+                for i, (uid, should_capture) in enumerate(
+                    zip(batch.uids, batch.capture_prompt_boundaries)
+                )
+                if should_capture
+            ]
+            if capture_entries:
+                self.prompt_cache_capture_callback(capture_entries)
             self.unprocessed_prompts = self.unprocessed_prompts[
                 self.prefill_batch_size :
             ]

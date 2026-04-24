@@ -744,6 +744,7 @@ class TestPromptBoundaryCapture(unittest.TestCase):
                 prompts,
                 max_tokens=None,
                 caches=None,
+                capture_prompt_boundaries=None,
                 samplers=None,
                 logits_processors=None,
             ):

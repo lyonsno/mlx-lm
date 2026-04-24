@@ -827,6 +827,7 @@ class ResponseGenerator:
                         [rest],
                         args.max_tokens,
                         caches=[cache],
+                        capture_prompt_boundaries=[len(rest) > 0],
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
                     )
@@ -1028,7 +1029,9 @@ class ResponseGenerator:
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
-                prompt_cache_capture_callback=on_prompt_boundary,
+                prompt_cache_capture_callback=(
+                    on_prompt_boundary if capture_prompt_boundary else None
+                ),
             ):
                 rqueue.put(
                     Response(

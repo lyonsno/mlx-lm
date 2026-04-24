@@ -151,13 +151,31 @@ class TestGenerate(unittest.TestCase):
             max_tokens=1,
             prompt_cache_capture_callback=on_prompt_boundary,
         )
-        (uid,) = batch_gen.insert([prompt])
+        (uid,) = batch_gen.insert([prompt], capture_prompt_boundaries=[True])
 
         responses = batch_gen.next()
         self.assertEqual(len(responses), 1)
         self.assertIn(uid, captured)
         self.assertTrue(all(c.offset == len(prompt) for c in captured[uid]))
         self.assertTrue(all(c.offset > len(prompt) for c in responses[0].prompt_cache))
+
+    def test_batch_generator_skips_prompt_boundary_capture_when_not_requested(self):
+        prompt = self.tokenizer.encode("hello")
+        captured = []
+
+        def on_prompt_boundary(entries):
+            captured.extend(entries)
+
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            prompt_cache_capture_callback=on_prompt_boundary,
+        )
+        batch_gen.insert([prompt], capture_prompt_boundaries=[False])
+
+        responses = batch_gen.next()
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(captured, [])
 
     def test_speculative_rewind_uses_recoverable_non_trimmable_cache(self):
         class RewindOnlyLayer:
@@ -239,6 +257,137 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(len(captured[0]), len(prompt_cache))
         self.assertTrue(all(c.offset == len(prompt) for c in captured[0]))
         self.assertTrue(all(c.offset >= len(prompt) for c in prompt_cache))
+
+    def test_speculative_prompt_boundary_callback_raises_on_unrecoverable_boundary(
+        self,
+    ):
+        class RewindOnlyLayer:
+            def __init__(self, offset):
+                self.offset = offset
+
+            @property
+            def nbytes(self):
+                return 1
+
+            def is_trimmable(self):
+                return False
+
+            def can_rewind(self, n):
+                return n <= self.offset
+
+            def rewind(self, n):
+                if n > self.offset:
+                    return False
+                self.offset -= n
+                return True
+
+        class FakeModel:
+            def __init__(self, token):
+                self.token = token
+                self.layers = [object()]
+
+            def __call__(self, y, cache=None):
+                vocab = 4
+                logits = mx.zeros((1, y.shape[1], vocab), dtype=mx.float32)
+                logits[:, :, self.token] = 1.0
+                return logits
+
+        prompt = mx.array([0], dtype=mx.uint32)
+        model = FakeModel(token=2)
+        draft_model = FakeModel(token=1)
+        prompt_cache = [
+            RewindOnlyLayer(offset=0),
+            RewindOnlyLayer(offset=2),
+        ]
+
+        with self.assertRaisesRegex(
+            ValueError, "Model cache cannot capture speculative prompt boundary safely."
+        ):
+            list(
+                speculative_generate_step(
+                    prompt,
+                    model,
+                    draft_model,
+                    prompt_cache=prompt_cache,
+                    num_draft_tokens=1,
+                    max_tokens=1,
+                    prompt_cache_capture_callback=lambda *_: None,
+                )
+            )
+
+    def test_speculative_prompt_boundary_callback_raises_when_rewind_breaks_contract(
+        self,
+    ):
+        class BrokenRewindLayer:
+            def __init__(self):
+                self.offset = 2
+
+            @property
+            def nbytes(self):
+                return 1
+
+            def is_trimmable(self):
+                return False
+
+            def can_rewind(self, n):
+                return True
+
+            def rewind(self, n):
+                return False
+
+        class RewindOnlyLayer:
+            def __init__(self, offset):
+                self.offset = offset
+
+            @property
+            def nbytes(self):
+                return 1
+
+            def is_trimmable(self):
+                return False
+
+            def can_rewind(self, n):
+                return n <= self.offset
+
+            def rewind(self, n):
+                if n > self.offset:
+                    return False
+                self.offset -= n
+                return True
+
+        class FakeModel:
+            def __init__(self, token):
+                self.token = token
+                self.layers = [object()]
+
+            def __call__(self, y, cache=None):
+                vocab = 4
+                logits = mx.zeros((1, y.shape[1], vocab), dtype=mx.float32)
+                logits[:, :, self.token] = 1.0
+                return logits
+
+        prompt = mx.array([0], dtype=mx.uint32)
+        model = FakeModel(token=2)
+        draft_model = FakeModel(token=1)
+        prompt_cache = [
+            BrokenRewindLayer(),
+            RewindOnlyLayer(offset=2),
+        ]
+
+        with self.assertRaisesRegex(
+            ValueError, "Model cache prompt-boundary capture failed unexpectedly."
+        ):
+            list(
+                speculative_generate_step(
+                    prompt,
+                    model,
+                    draft_model,
+                    prompt_cache=prompt_cache,
+                    num_draft_tokens=1,
+                    max_tokens=1,
+                    prompt_cache_capture_callback=lambda *_: None,
+                )
+            )
 
     def test_stream_generate_input_embeddings(self):
         sampler = make_sampler(temp=0.0)  # determinate sampler
