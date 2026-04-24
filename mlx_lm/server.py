@@ -791,6 +791,7 @@ class ResponseGenerator:
                         max_tokens=[args.max_tokens],
                         caches=[cache],
                         all_tokens=[prompt[:prompt_cache_count]],
+                        capture_prompt_boundaries=[len(rest) > 0],
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
                         state_machines=[sm],
@@ -1014,7 +1015,9 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
-                prompt_cache_capture_callback=on_prompt_boundary,
+                prompt_cache_capture_callback=(
+                    on_prompt_boundary if capture_prompt_boundary else None
+                ),
             ):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)

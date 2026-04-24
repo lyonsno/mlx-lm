@@ -701,7 +701,8 @@ def speculative_generate_step(
                 prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
             _rewind_cache(num_draft, n)
     finally:
-        _rewind_cache(num_draft, n)
+        if captured_prompt_boundary:
+            _rewind_cache(num_draft, n)
 
 
 def stream_generate(
@@ -1644,6 +1645,7 @@ class BatchGenerator:
         max_tokens: Optional[List[int]] = None,
         caches: Optional[List[List[Any]]] = None,
         all_tokens: Optional[List[List[int]]] = None,
+        capture_prompt_boundaries: Optional[List[bool]] = None,
         samplers: Optional[List[Callable[[mx.array], mx.array]]] = None,
         logits_processors: Optional[
             List[List[Callable[[mx.array, mx.array], mx.array]]]
@@ -1655,6 +1657,7 @@ class BatchGenerator:
             max_tokens,
             caches,
             all_tokens,
+            capture_prompt_boundaries,
             samplers,
             logits_processors,
             state_machines,
@@ -1666,6 +1669,7 @@ class BatchGenerator:
         max_tokens: Optional[List[int]] = None,
         caches: Optional[List[List[Any]]] = None,
         all_tokens: Optional[List[List[int]]] = None,
+        capture_prompt_boundaries: Optional[List[bool]] = None,
         samplers: Optional[List[Callable[[mx.array], mx.array]]] = None,
         logits_processors: Optional[
             List[List[Callable[[mx.array, mx.array], mx.array]]]
@@ -1676,6 +1680,7 @@ class BatchGenerator:
 
         max_tokens = max_tokens or [self.max_tokens] * len(segments)
         all_tokens = all_tokens or [[] for _ in segments]
+        capture_prompt_boundaries = capture_prompt_boundaries or [False] * len(segments)
         samplers = samplers or [None] * len(segments)
         logits_processors = logits_processors or (
             [self.logits_processors] * len(segments)
@@ -1689,11 +1694,12 @@ class BatchGenerator:
             if caches[i] is None:
                 caches[i] = self._make_new_cache()
 
-        for seq, m, c, at, s, lp, sm in zip(
+        for seq, m, c, at, cpb, s, lp, sm in zip(
             segments,
             max_tokens,
             caches,
             all_tokens,
+            capture_prompt_boundaries,
             samplers,
             logits_processors,
             state_machines,
@@ -1703,7 +1709,7 @@ class BatchGenerator:
                 seq.append(seq[-1][-1:])
                 seq[-2] = seq[-2][:-1]
             self._unprocessed_sequences.append(
-                (self._uid_count, seq, m, c, at, s, lp, sm)
+                (self._uid_count, seq, m, c, at, cpb, s, lp, sm)
             )
             uids.append(self._uid_count)
             self._uid_count += 1
@@ -1792,6 +1798,7 @@ class BatchGenerator:
         uids = []
         caches = []
         tokens = []
+        capture_prompt_boundaries = []
         samplers = []
         logits_processors = []
         max_tokens = []
@@ -1801,25 +1808,29 @@ class BatchGenerator:
             uids.append(sequence[0])
             caches.append(sequence[3])
             tokens.append(sequence[4])
-            samplers.append(sequence[5])
-            logits_processors.append(sequence[6])
+            capture_prompt_boundaries.append(sequence[5])
+            samplers.append(sequence[6])
+            logits_processors.append(sequence[7])
             max_tokens.append(sequence[2])
-            state_machines.append(sequence[7])
+            state_machines.append(sequence[8])
             self._currently_processing.append(
-                [sequence[1], 0, sum(len(s) for s in sequence[1])]
+                [sequence[1], 0, sum(len(s) for s in sequence[1]), sequence[5]]
             )
 
-        return PromptProcessingBatch(
-            model=self.model,
-            uids=uids,
-            caches=caches,
-            tokens=tokens,
-            prefill_step_size=self.prefill_step_size,
-            samplers=samplers,
-            fallback_sampler=self.sampler,
-            logits_processors=logits_processors,
-            state_machines=state_machines,
-            max_tokens=max_tokens,
+        return (
+            PromptProcessingBatch(
+                model=self.model,
+                uids=uids,
+                caches=caches,
+                tokens=tokens,
+                prefill_step_size=self.prefill_step_size,
+                samplers=samplers,
+                fallback_sampler=self.sampler,
+                logits_processors=logits_processors,
+                state_machines=state_machines,
+                max_tokens=max_tokens,
+            ),
+            capture_prompt_boundaries,
         )
 
     def _next(self):
@@ -1844,7 +1855,8 @@ class BatchGenerator:
             len(self._unprocessed_sequences),
         )
         if n > 0:
-            self._prompt_batch.extend(self._make_batch(n))
+            new_prompt_batch, _ = self._make_batch(n)
+            self._prompt_batch.extend(new_prompt_batch)
 
         # Split the prompt sequences to the ones moving to generation and the rest
         keep = []
@@ -1860,14 +1872,19 @@ class BatchGenerator:
         if split:
             last_inputs = [self._currently_processing[i][0][0] for i in split]
             progress = [(self._currently_processing[i][2],) * 2 for i in split]
+            capture_entries = []
+            for current_idx in split:
+                if self._currently_processing[current_idx][3]:
+                    capture_entries.append(
+                        (
+                            self._prompt_batch.uids[current_idx],
+                            self._prompt_batch.extract_cache(current_idx),
+                        )
+                    )
             self._currently_processing = [self._currently_processing[i] for i in keep]
             boundary_batch = self._prompt_batch.split(split)
-            self.prompt_cache_capture_callback(
-                [
-                    (uid, boundary_batch.extract_cache(i))
-                    for i, uid in enumerate(boundary_batch.uids)
-                ]
-            )
+            if capture_entries:
+                self.prompt_cache_capture_callback(capture_entries)
             gen_batch = boundary_batch.generate(last_inputs)
             for i, p in enumerate(progress):
                 prompt_responses.append(
