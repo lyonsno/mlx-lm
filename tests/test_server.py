@@ -89,6 +89,9 @@ class MockCache:
     def nbytes(self):
         return len(self.value)
 
+    def is_trimmable(self):
+        return False
+
     def __eq__(self, other):
         return other.value == self.value
 
@@ -951,6 +954,64 @@ class TestPromptBoundaryCapture(unittest.TestCase):
         self.assertIs(insert_calls[0].args[2], boundary_cache)
         self.assertEqual(insert_calls[1].args[1], prompt + [99])
         self.assertIs(insert_calls[1].args[2], live_cache)
+
+    def test_serve_single_boundary_capture_restores_prompt_when_completion_cache_cannot(
+        self,
+    ):
+        prompt = [1, 2, 3]
+        completion_key = prompt + [99]
+        boundary_cache = [MockCache("boundary-cache")]
+        live_cache = [MockCache("live-cache")]
+        args = self._make_args()
+        rqueue = Queue()
+        request = CompletionRequest(
+            request_type="text",
+            prompt="hello",
+            messages=[],
+            tools=None,
+            role_mapping=None,
+        )
+
+        baseline_cache = LRUPromptCache()
+        baseline_cache.insert_cache(
+            self.model_provider.model_key,
+            completion_key,
+            live_cache,
+        )
+        baseline_reused, baseline_remaining = baseline_cache.fetch_nearest_cache(
+            self.model_provider.model_key,
+            prompt,
+        )
+        self.assertIsNone(baseline_reused)
+        self.assertEqual(baseline_remaining, prompt)
+
+        self.response_generator._tokenize = lambda tokenizer, request, args: prompt
+
+        def fake_stream_generate(*args, **kwargs):
+            kwargs["prompt_cache_capture_callback"](boundary_cache)
+            yield SimpleNamespace(
+                text="x",
+                token=99,
+                logprobs=mx.zeros((4,), dtype=mx.float32),
+                finish_reason="stop",
+            )
+
+        with (
+            patch.object(
+                self.prompt_cache,
+                "fetch_nearest_cache",
+                return_value=(live_cache, prompt),
+            ),
+            patch("mlx_lm.server.stream_generate", fake_stream_generate),
+        ):
+            self.response_generator._serve_single((rqueue, request, args))
+
+        reused_cache, remaining = self.prompt_cache.fetch_nearest_cache(
+            self.model_provider.model_key,
+            prompt,
+        )
+        self.assertEqual(reused_cache, boundary_cache)
+        self.assertEqual(remaining, [])
 
 
 if __name__ == "__main__":
