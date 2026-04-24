@@ -1000,8 +1000,9 @@ class TestPromptBoundaryCapture(unittest.TestCase):
             patch.object(
                 self.prompt_cache,
                 "fetch_nearest_cache",
-                return_value=(live_cache, prompt),
+                return_value=(None, prompt),
             ),
+            patch("mlx_lm.server.make_prompt_cache", return_value=live_cache),
             patch("mlx_lm.server.stream_generate", fake_stream_generate),
         ):
             self.response_generator._serve_single((rqueue, request, args))
@@ -1086,8 +1087,9 @@ class TestPromptBoundaryCapture(unittest.TestCase):
             patch.object(
                 self.prompt_cache,
                 "fetch_nearest_cache",
-                return_value=(live_cache, prompt),
+                return_value=(None, prompt),
             ),
+            patch("mlx_lm.server.make_prompt_cache", return_value=live_cache),
             patch("mlx_lm.server.BatchGenerator", FakeBatchGenerator),
         ):
             ctx, responses = self.response_generator.generate(request, args)
