@@ -326,6 +326,16 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(cache[0].offset, 1)
         self.assertEqual(cache[1].offset, 1)
 
+    def test_arrays_cache_zero_rewind_is_safe_but_positive_rewind_fails_closed(self):
+        arrays = ArraysCache(size=2)
+        arrays[0] = mx.zeros((1, 3, 4))
+        arrays[1] = mx.zeros((1, 4, 5))
+
+        self.assertTrue(can_rewind_prompt_cache([arrays], 0))
+        self.assertTrue(rewind_prompt_cache([arrays], 0))
+        self.assertFalse(can_rewind_prompt_cache([arrays], 1))
+        self.assertFalse(rewind_prompt_cache([arrays], 1))
+
     def test_can_rewind_prompt_cache_surfaces_unexpected_errors(self):
         class BrokenLayer:
             @property

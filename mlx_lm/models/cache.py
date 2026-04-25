@@ -238,10 +238,10 @@ class _BaseCache:
         return False
 
     def can_rewind(self, num_to_trim: int) -> bool:
-        if not bool(self.is_trimmable()):
-            return False
         if num_to_trim <= 0:
             return True
+        if not bool(self.is_trimmable()):
+            return False
 
         offset = getattr(self, "offset", None)
         if isinstance(offset, numbers.Integral):
