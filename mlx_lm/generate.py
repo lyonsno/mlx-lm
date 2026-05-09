@@ -318,6 +318,7 @@ def generate_step(
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+    prompt_cache_boundary_callback: Optional[Callable[[List[Any]], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -345,6 +346,9 @@ def generate_step(
            when ``kv_bits`` is non-None. Default: ``0``.
         prompt_progress_callback (Callable[[int, int], None]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
+        prompt_cache_boundary_callback (Callable[[List[Any]], None]): A callback
+           invoked once after the cache reaches the exact prompt boundary and
+           before generated tokens are added to the cache.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
 
@@ -451,6 +455,10 @@ def generate_step(
             mx.clear_cache()
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
+
+    if prompt_cache_boundary_callback is not None:
+        mx.eval([c.state for c in prompt_cache])
+        prompt_cache_boundary_callback(prompt_cache)
 
     mx.async_eval(y, logprobs)
     n = 0
@@ -708,6 +716,7 @@ def stream_generate(
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
+        kwargs.pop("prompt_cache_boundary_callback", None)
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )

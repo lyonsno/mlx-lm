@@ -15,7 +15,12 @@ from mlx_lm.generate import (
     generate_step,
     stream_generate,
 )
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import (
+    KVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+    make_prompt_cache_boundary,
+)
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
@@ -62,6 +67,28 @@ class TestGenerate(unittest.TestCase):
         ):
             tokens.append(response.token)
         self.assertEqual(len(tokens), 4)
+
+    def test_generate_step_prompt_cache_boundary_callback(self):
+        prompt = self.tokenizer.encode("hello", return_tensors="mlx")[0]
+        prompt_cache = make_prompt_cache(self.model)
+        boundaries = []
+
+        def boundary_callback(cache):
+            boundaries.append(make_prompt_cache_boundary(cache))
+
+        list(
+            generate_step(
+                prompt,
+                self.model,
+                max_tokens=2,
+                prompt_cache=prompt_cache,
+                prompt_cache_boundary_callback=boundary_callback,
+            )
+        )
+
+        self.assertEqual(len(boundaries), 1)
+        self.assertEqual(boundaries[0][0].size(), len(prompt))
+        self.assertGreater(prompt_cache[0].size(), boundaries[0][0].size())
 
     def test_generate_with_processor(self):
         init_toks = self.tokenizer.encode("hello")
