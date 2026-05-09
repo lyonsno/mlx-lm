@@ -92,6 +92,20 @@ class MockCache:
         return n
 
 
+class RewindableMockCache(MockCache):
+    def __init__(self, value):
+        super().__init__(value, is_trimmable=False)
+        self.rewound = 0
+
+    def can_rewind(self, n):
+        return n
+
+    def rewind(self, n):
+        self.rewound += n
+        self.value = self.value[:-n] if n else self.value
+        return n
+
+
 class TestProcessControlTokens(unittest.TestCase):
     @staticmethod
     def _r(text, state, match=None):
@@ -638,6 +652,18 @@ class TestLRUPromptCache(unittest.TestCase):
         cache.insert_cache(model, [1, 2, 3], [MockCache("abc")])
         self.assertEqual(len(cache), 1)
         self.assertEqual(cache.nbytes, 3)
+
+    def test_longer_hit_reuses_rewindable_non_trimmable_cache(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        cache.insert_cache(model, [1, 2, 3, 4], [RewindableMockCache([1, 2, 3, 4])])
+
+        prompt_cache, remaining_tokens = cache.fetch_nearest_cache(model, [1, 2, 9])
+
+        self.assertIsNotNone(prompt_cache)
+        self.assertEqual(prompt_cache[0].value, [1, 2])
+        self.assertEqual(prompt_cache[0].rewound, 2)
+        self.assertEqual(remaining_tokens, [9])
 
     def test_insert_empty_tokens_does_not_self_destruct(self):
         cache = LRUPromptCache(max_size=10)

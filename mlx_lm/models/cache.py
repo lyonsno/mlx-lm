@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import numbers
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -109,6 +110,95 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     if not can_trim_prompt_cache(cache) or len(cache) == 0:
         return 0
     return [c.trim(num_tokens) for c in cache][0]
+
+
+def _is_exact_rewind_result(result: Any, num_tokens: int) -> bool:
+    if isinstance(result, bool):
+        return result
+    if isinstance(result, numbers.Integral):
+        return int(result) == num_tokens
+    return False
+
+
+def _cache_rewind_capacity(cache: Any) -> Optional[int]:
+    size = getattr(cache, "size", None)
+    if callable(size):
+        try:
+            capacity = size()
+        except Exception:
+            capacity = None
+        if isinstance(capacity, numbers.Integral) and int(capacity) > 0:
+            return int(capacity)
+
+    offset = getattr(cache, "offset", None)
+    if isinstance(offset, numbers.Integral):
+        start_position = getattr(cache, "start_position", 0)
+        if isinstance(start_position, numbers.Integral):
+            return max(0, int(offset) - int(start_position))
+        return int(offset)
+
+    return None
+
+
+def _can_rewind_layer_cache(cache: Any, num_tokens: int) -> bool:
+    if num_tokens < 0:
+        return False
+    if num_tokens == 0:
+        return True
+
+    can_rewind = getattr(cache, "can_rewind", None)
+    if callable(can_rewind):
+        return _is_exact_rewind_result(can_rewind(num_tokens), num_tokens)
+
+    is_trimmable = getattr(cache, "is_trimmable", None)
+    trim = getattr(cache, "trim", None)
+    if callable(is_trimmable) and callable(trim) and is_trimmable():
+        capacity = _cache_rewind_capacity(cache)
+        return capacity is not None and num_tokens <= capacity
+
+    return False
+
+
+def can_rewind_prompt_cache(cache: List[Any], num_tokens: int) -> bool:
+    """
+    Check whether the model's cache can be rewound by exactly ``num_tokens``.
+    """
+    return len(cache) > 0 and all(_can_rewind_layer_cache(c, num_tokens) for c in cache)
+
+
+def _rewind_layer_cache(cache: Any, num_tokens: int) -> int:
+    if num_tokens == 0:
+        return 0
+
+    rewind = getattr(cache, "rewind", None)
+    if callable(rewind):
+        return (
+            num_tokens
+            if _is_exact_rewind_result(rewind(num_tokens), num_tokens)
+            else 0
+        )
+
+    trim = getattr(cache, "trim", None)
+    if callable(trim):
+        return num_tokens if _is_exact_rewind_result(trim(num_tokens), num_tokens) else 0
+
+    return 0
+
+
+def rewind_prompt_cache(cache: List[Any], num_tokens: int) -> int:
+    """
+    Rewind the model's cache in-place by exactly ``num_tokens``.
+
+    Returns ``0`` without mutating when the cache cannot prove exact rewind
+    support across every layer. Numeric partial success is failure.
+    """
+    if not can_rewind_prompt_cache(cache, num_tokens):
+        return 0
+
+    for c in cache:
+        if _rewind_layer_cache(c, num_tokens) != num_tokens:
+            return 0
+    return num_tokens
 
 
 def create_attention_mask(
@@ -824,6 +914,17 @@ class CacheList(_BaseCache):
     def trim(self, n):
         for c in self.caches:
             m = c.trim(n)
+        return m
+
+    def can_rewind(self, n):
+        return all(_can_rewind_layer_cache(c, n) for c in self.caches)
+
+    def rewind(self, n):
+        if not self.can_rewind(n):
+            return 0
+        m = 0
+        for c in self.caches:
+            m = _rewind_layer_cache(c, n)
         return m
 
     @property
@@ -1680,10 +1781,14 @@ class LRUPromptCache:
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
-            if can_trim_prompt_cache(cache_entry.prompt_cache):
+            prefix = min(len(tokens) - 1, result.common_prefix)
+            num_to_trim = len(result.longer) - prefix
+            if can_rewind_prompt_cache(cache_entry.prompt_cache, num_to_trim):
                 cache = copy.deepcopy(cache_entry.prompt_cache)
-                prefix = min(len(tokens) - 1, result.common_prefix)
-                num_to_trim = len(result.longer) - prefix
+                rewind_prompt_cache(cache, num_to_trim)
+                return cache, tokens[prefix:]
+            elif can_trim_prompt_cache(cache_entry.prompt_cache):
+                cache = copy.deepcopy(cache_entry.prompt_cache)
                 trim_prompt_cache(cache, num_to_trim)
                 return cache, tokens[prefix:]
 

@@ -18,8 +18,10 @@ from mlx_lm.models.cache import (
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
+    can_rewind_prompt_cache,
     load_prompt_cache,
     make_prompt_cache,
+    rewind_prompt_cache,
     save_prompt_cache,
     trim_prompt_cache,
 )
@@ -261,6 +263,28 @@ class TestPromptCache(unittest.TestCase):
         # Trim more tokens than remain
         num_trimmed = trim_prompt_cache(cache, 4)
         self.assertEqual(num_trimmed, 3)
+
+    def test_rewind_cache_requires_exact_numeric_success(self):
+        class PartialNumericRewindCache:
+            def __init__(self):
+                self.calls = []
+
+            @property
+            def nbytes(self):
+                return 0
+
+            def can_rewind(self, n):
+                self.calls.append(("can_rewind", n))
+                return n - 1
+
+            def rewind(self, n):
+                self.calls.append(("rewind", n))
+                return n - 1
+
+        layer = PartialNumericRewindCache()
+        self.assertFalse(can_rewind_prompt_cache([layer], 2))
+        self.assertEqual(rewind_prompt_cache([layer], 2), 0)
+        self.assertEqual(layer.calls, [("can_rewind", 2), ("can_rewind", 2)])
 
     def test_trim_cache_with_generate(self):
         model, tokenizer = self.model, self.tokenizer
