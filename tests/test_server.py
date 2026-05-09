@@ -894,6 +894,27 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
 
+    def test_lru_bytes_account_for_boundaries(self):
+        cache = LRUPromptCache(max_size=100, max_bytes=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(
+            model,
+            [1, 2, 3],
+            [MockCache("aaa")],
+            cache_boundaries={2: [MockCache("bb")]},
+        )
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.nbytes, 5)
+
+        cache.insert_cache(model, [4, 5, 6], [MockCache("cccccc")])
+
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.nbytes, 6)
+        c, t = cache.fetch_nearest_cache(model, [1, 2, 9])
+        self.assertIsNone(c)
+        self.assertEqual(t, [1, 2, 9])
+
 
 if __name__ == "__main__":
     unittest.main()

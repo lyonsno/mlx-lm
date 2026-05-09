@@ -316,6 +316,13 @@ class TestPromptCache(unittest.TestCase):
         extra = mx.ones((1, 1, 2, 4)) * 7
         cache[1].update_and_fetch(extra, extra + 100)
 
+        self.assertTrue(mx.array_equal(boundary[0][0], mx.ones((1, 2, 3))))
+        self.assertTrue(mx.array_equal(boundary[0][1], mx.ones((1, 2, 3)) * 2))
+        boundary_keys, boundary_values = boundary[1].state
+        self.assertEqual(boundary[1].offset, 3)
+        self.assertTrue(mx.array_equal(boundary_keys, keys))
+        self.assertTrue(mx.array_equal(boundary_values, keys + 100))
+
         restored = restore_prompt_cache_boundary(cache, boundary)
 
         self.assertIs(restored, cache)
