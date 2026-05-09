@@ -10,7 +10,7 @@ import unittest
 import mlx.core as mx
 import requests
 
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import ArraysCache, KVCache, make_prompt_cache_boundary
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
@@ -664,6 +664,35 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(prompt_cache[0].value, [1, 2])
         self.assertEqual(prompt_cache[0].rewound, 2)
         self.assertEqual(remaining_tokens, [9])
+
+    def test_longer_hit_restores_mixed_cache_boundary(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        mixed_cache = [ArraysCache(size=1), KVCache()]
+        mixed_cache[0][0] = mx.ones((1, 2, 3))
+        keys = mx.arange(8).reshape(1, 1, 2, 4)
+        mixed_cache[1].update_and_fetch(keys, keys + 100)
+        boundary = make_prompt_cache_boundary(mixed_cache)
+
+        mixed_cache[0][0] = mx.zeros((1, 2, 3))
+        extra = mx.ones((1, 1, 2, 4)) * 7
+        mixed_cache[1].update_and_fetch(extra, extra + 100)
+        cache.insert_cache(
+            model,
+            [1, 2, 3, 4],
+            mixed_cache,
+            cache_boundaries={2: boundary},
+        )
+
+        prompt_cache, remaining_tokens = cache.fetch_nearest_cache(model, [1, 2, 9])
+
+        self.assertIsNotNone(prompt_cache)
+        self.assertEqual(remaining_tokens, [9])
+        self.assertTrue(mx.array_equal(prompt_cache[0][0], mx.ones((1, 2, 3))))
+        restored_keys, restored_values = prompt_cache[1].state
+        self.assertEqual(prompt_cache[1].offset, 2)
+        self.assertTrue(mx.array_equal(restored_keys, keys))
+        self.assertTrue(mx.array_equal(restored_values, keys + 100))
 
     def test_insert_empty_tokens_does_not_self_destruct(self):
         cache = LRUPromptCache(max_size=10)

@@ -19,8 +19,10 @@ from mlx_lm.models.cache import (
     QuantizedKVCache,
     RotatingKVCache,
     can_rewind_prompt_cache,
+    make_prompt_cache_boundary,
     load_prompt_cache,
     make_prompt_cache,
+    restore_prompt_cache_boundary,
     rewind_prompt_cache,
     save_prompt_cache,
     trim_prompt_cache,
@@ -285,6 +287,44 @@ class TestPromptCache(unittest.TestCase):
         self.assertFalse(can_rewind_prompt_cache([layer], 2))
         self.assertEqual(rewind_prompt_cache([layer], 2), 0)
         self.assertEqual(layer.calls, [("can_rewind", 2), ("can_rewind", 2)])
+
+    def test_arrays_cache_rewind_fails_closed_for_positive_tokens(self):
+        cache = ArraysCache(size=2)
+        cache[0] = mx.ones((1, 2, 3))
+        cache[1] = mx.ones((1, 2, 3)) * 2
+        original = copy.deepcopy(cache.state)
+
+        self.assertTrue(cache.can_rewind(0))
+        self.assertEqual(cache.rewind(0), 0)
+        self.assertFalse(cache.can_rewind(1))
+        self.assertEqual(cache.rewind(1), 0)
+
+        self.assertTrue(mx.array_equal(cache.state[0], original[0]))
+        self.assertTrue(mx.array_equal(cache.state[1], original[1]))
+
+    def test_prompt_cache_boundary_restores_mixed_recurrent_cache(self):
+        cache = [ArraysCache(size=2), KVCache()]
+        cache[0][0] = mx.ones((1, 2, 3))
+        cache[0][1] = mx.ones((1, 2, 3)) * 2
+        keys = mx.arange(12).reshape(1, 1, 3, 4)
+        cache[1].update_and_fetch(keys, keys + 100)
+
+        boundary = make_prompt_cache_boundary(cache)
+
+        cache[0][0] = mx.zeros((1, 2, 3))
+        cache[0][1] = mx.zeros((1, 2, 3))
+        extra = mx.ones((1, 1, 2, 4)) * 7
+        cache[1].update_and_fetch(extra, extra + 100)
+
+        restored = restore_prompt_cache_boundary(cache, boundary)
+
+        self.assertIs(restored, cache)
+        self.assertTrue(mx.array_equal(cache[0][0], mx.ones((1, 2, 3))))
+        self.assertTrue(mx.array_equal(cache[0][1], mx.ones((1, 2, 3)) * 2))
+        restored_keys, restored_values = cache[1].state
+        self.assertEqual(cache[1].offset, 3)
+        self.assertTrue(mx.array_equal(restored_keys, keys))
+        self.assertTrue(mx.array_equal(restored_values, keys + 100))
 
     def test_trim_cache_with_generate(self):
         model, tokenizer = self.model, self.tokenizer

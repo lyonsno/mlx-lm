@@ -112,6 +112,24 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     return [c.trim(num_tokens) for c in cache][0]
 
 
+def make_prompt_cache_boundary(cache: List[Any]) -> List[Any]:
+    """
+    Capture an exact prompt-cache boundary for later restoration.
+
+    This is the recovery primitive for cache layers that cannot derive an old
+    recurrent state from a later state by rewinding token counts.
+    """
+    return copy.deepcopy(cache)
+
+
+def restore_prompt_cache_boundary(cache: List[Any], boundary: List[Any]) -> List[Any]:
+    """
+    Restore ``cache`` in-place to a previously captured boundary.
+    """
+    cache[:] = copy.deepcopy(boundary)
+    return cache
+
+
 def _is_exact_rewind_result(result: Any, num_tokens: int) -> bool:
     if isinstance(result, bool):
         return result
@@ -777,6 +795,12 @@ class ArraysCache(_BaseCache):
             self.lengths -= N
         if self.left_padding is not None:
             self.left_padding -= N
+
+    def can_rewind(self, n):
+        return n == 0
+
+    def rewind(self, n):
+        return 0
 
     def make_mask(self, N: int):
         if self.left_padding is not None:
@@ -1727,6 +1751,7 @@ class LRUPromptCache:
         prompt_cache: List[Any]
         nbytes: int
         cache_type: str
+        cache_boundaries: Dict[int, List[Any]]
 
     class CacheOrder:
         def __init__(self, ordering: List[str] = ["assistant", "user", "system"]):
@@ -1791,6 +1816,9 @@ class LRUPromptCache:
                 cache = copy.deepcopy(cache_entry.prompt_cache)
                 trim_prompt_cache(cache, num_to_trim)
                 return cache, tokens[prefix:]
+            elif prefix in cache_entry.cache_boundaries:
+                cache = make_prompt_cache_boundary(cache_entry.cache_boundaries[prefix])
+                return cache, tokens[prefix:]
 
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
@@ -1805,10 +1833,19 @@ class LRUPromptCache:
         prompt_cache: List[Any],
         *,
         cache_type: str = "assistant",
+        cache_boundaries: Optional[Dict[int, List[Any]]] = None,
     ):
+        cache_boundaries = {
+            prefix: make_prompt_cache_boundary(boundary)
+            for prefix, boundary in (cache_boundaries or {}).items()
+        }
+        nbytes = sum(c.nbytes for c in prompt_cache) + sum(
+            sum(c.nbytes for c in boundary) for boundary in cache_boundaries.values()
+        )
+
         # Make the cache entry
         entry = LRUPromptCache.CacheEntry(
-            prompt_cache, sum(c.nbytes for c in prompt_cache), cache_type
+            prompt_cache, nbytes, cache_type, cache_boundaries
         )
 
         # Insert into the trie and update the byte counter and lru position
