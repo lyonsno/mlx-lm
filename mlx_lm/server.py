@@ -41,6 +41,7 @@ from .generate import (
 from .models.cache import (
     LRUPromptCache,
     make_prompt_cache,
+    make_prompt_cache_boundary,
 )
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
@@ -788,6 +789,7 @@ class ResponseGenerator:
                         "detokenizer": tokenizer.detokenizer,
                         "segment_types": segment_types[::-1],
                         "top_logprobs": args.top_logprobs,
+                        "cache_boundaries": {},
                     }
                     # just making sure we don't leave a reference around
                     del cache
@@ -861,6 +863,20 @@ class ResponseGenerator:
                         if result["ctx"]._should_stop:
                             uids_to_remove.append(r.uid)
 
+                    prompt_boundary_ids = [
+                        r.uid
+                        for r in prompt_responses
+                        if r.end_of_prompt and r.uid in batch_results
+                    ]
+                    boundary_caches = batch_generator.extract_cache(
+                        prompt_boundary_ids
+                    )
+                    for uid, (cache, cache_key) in boundary_caches.items():
+                        batch_results[uid]["cache_boundaries"][len(cache_key)] = (
+                            make_prompt_cache_boundary(cache)
+                        )
+                    del boundary_caches
+
                     # Save the caches at end of segments
                     eos_ids = [
                         r.uid
@@ -905,6 +921,7 @@ class ResponseGenerator:
                                 r.all_tokens[:],
                                 r.prompt_cache,
                                 cache_type="assistant",
+                                cache_boundaries=result["cache_boundaries"],
                             )
                             del batch_results[r.uid]
 
@@ -967,10 +984,16 @@ class ResponseGenerator:
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
+            cache_boundaries = {}
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
+
+            def record_prompt_cache_boundary(prompt_cache):
+                cache_boundaries[len(prompt)] = make_prompt_cache_boundary(
+                    prompt_cache
+                )
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -984,6 +1007,7 @@ class ResponseGenerator:
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
+                prompt_cache_boundary_callback=record_prompt_cache_boundary,
                 prefill_step_size=self.cli_args.prefill_step_size,
             ):
                 finish_reason = gen.finish_reason
@@ -1017,7 +1041,10 @@ class ResponseGenerator:
 
             # Save the KV cache again
             self.prompt_cache.insert_cache(
-                self.model_provider.model_key, cache_key, cache
+                self.model_provider.model_key,
+                cache_key,
+                cache,
+                cache_boundaries=cache_boundaries,
             )
 
         except Exception as e:

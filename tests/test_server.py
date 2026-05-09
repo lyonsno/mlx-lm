@@ -6,6 +6,8 @@ import json
 import threading
 import types
 import unittest
+from queue import Queue
+from unittest.mock import patch
 
 import mlx.core as mx
 import requests
@@ -13,9 +15,13 @@ import requests
 from mlx_lm.models.cache import ArraysCache, KVCache, make_prompt_cache_boundary
 from mlx_lm.server import (
     APIHandler,
+    GenerationArguments,
+    LogitsProcessorArguments,
     LRUPromptCache,
+    ModelDescription,
     Response,
     ResponseGenerator,
+    SamplingArguments,
     _process_control_tokens,
 )
 from mlx_lm.utils import load
@@ -106,6 +112,14 @@ class RewindableMockCache(MockCache):
         return n
 
 
+class FakeSequenceStateMachine:
+    def make_state(self):
+        return "normal"
+
+    def match(self, state, token):
+        return state, None, state
+
+
 class TestProcessControlTokens(unittest.TestCase):
     @staticmethod
     def _r(text, state, match=None):
@@ -168,6 +182,111 @@ class TestProcessControlTokens(unittest.TestCase):
         self.assertEqual(
             [t.state for t in out],
             ["tool", "tool", "tool", "normal", "normal"],
+        )
+
+
+class TestResponseGeneratorPromptCache(unittest.TestCase):
+    def test_serve_single_inserts_prompt_boundary_for_mixed_cache(self):
+        model_key = ("fake-model", None, None)
+        tokenizer = types.SimpleNamespace(
+            has_thinking=False,
+            has_tool_calling=False,
+            tool_parser=None,
+        )
+        model_provider = types.SimpleNamespace(
+            model=object(),
+            tokenizer=tokenizer,
+            draft_model=None,
+            model_key=model_key,
+            cli_args=types.SimpleNamespace(prefill_step_size=2048),
+            load=lambda *args, **kwargs: (object(), tokenizer),
+        )
+        response_generator = ResponseGenerator.__new__(ResponseGenerator)
+        response_generator.model_provider = model_provider
+        response_generator.prompt_cache = LRUPromptCache()
+        response_generator._is_distributed = False
+        response_generator._tokenize = lambda *args: ([1, 2], [], [], None)
+        response_generator._make_state_machine = lambda *args, **kwargs: (
+            FakeSequenceStateMachine(),
+            {},
+        )
+
+        def fake_stream_generate(*, prompt_cache, prompt_cache_boundary_callback, **_):
+            prompt_keys = mx.arange(2).reshape(1, 1, 2, 1)
+            prompt_cache[0][0] = mx.ones((1, 2, 3))
+            prompt_cache[1].update_and_fetch(prompt_keys, prompt_keys + 100)
+            prompt_cache_boundary_callback(prompt_cache)
+
+            prompt_cache[0][0] = mx.zeros((1, 2, 3))
+            tail = mx.ones((1, 1, 1, 1)) * 7
+            prompt_cache[1].update_and_fetch(tail, tail + 100)
+            yield types.SimpleNamespace(
+                text="x",
+                token=99,
+                logprobs={99: mx.array(0.0)},
+                finish_reason="length",
+            )
+
+        args = GenerationArguments(
+            model=ModelDescription("fake-model", None, None),
+            sampling=SamplingArguments(
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                min_p=0.0,
+                xtc_probability=0.0,
+                xtc_threshold=0.0,
+            ),
+            logits=LogitsProcessorArguments(
+                logit_bias={},
+                repetition_penalty=1.0,
+                repetition_context_size=0,
+                presence_penalty=0.0,
+                presence_context_size=0,
+                frequency_penalty=0.0,
+                frequency_context_size=0,
+            ),
+            stop_words=[],
+            max_tokens=1,
+            num_draft_tokens=0,
+            logprobs=False,
+            top_logprobs=0,
+            seed=None,
+            chat_template_kwargs={},
+        )
+
+        queue = Queue()
+        with (
+            patch(
+                "mlx_lm.server.make_prompt_cache",
+                return_value=[ArraysCache(1), KVCache()],
+            ),
+            patch(
+                "mlx_lm.server._make_sampler",
+                return_value=lambda logits: mx.argmax(logits, axis=-1),
+            ),
+            patch("mlx_lm.server._make_logits_processors", return_value=[]),
+            patch("mlx_lm.server.stream_generate", fake_stream_generate),
+        ):
+            response_generator._serve_single((queue, object(), args))
+
+        while not queue.empty():
+            response = queue.get()
+            if isinstance(response, Exception):
+                raise response
+
+        prompt_cache, remaining_tokens = (
+            response_generator.prompt_cache.fetch_nearest_cache(model_key, [1, 2, 5])
+        )
+
+        self.assertIsNotNone(prompt_cache)
+        self.assertEqual(remaining_tokens, [5])
+        self.assertTrue(mx.array_equal(prompt_cache[0][0], mx.ones((1, 2, 3))))
+        restored_keys, restored_values = prompt_cache[1].state
+        self.assertEqual(prompt_cache[1].offset, 2)
+        self.assertTrue(mx.array_equal(restored_keys, mx.arange(2).reshape(1, 1, 2, 1)))
+        self.assertTrue(
+            mx.array_equal(restored_values, mx.arange(2).reshape(1, 1, 2, 1) + 100)
         )
 
 
