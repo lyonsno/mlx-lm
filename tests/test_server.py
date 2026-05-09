@@ -22,6 +22,7 @@ from mlx_lm.server import (
     Response,
     ResponseGenerator,
     SamplingArguments,
+    _record_prompt_cache_boundaries,
     _process_control_tokens,
 )
 from mlx_lm.utils import load
@@ -186,6 +187,40 @@ class TestProcessControlTokens(unittest.TestCase):
 
 
 class TestResponseGeneratorPromptCache(unittest.TestCase):
+    def test_batched_prompt_boundary_capture_records_mixed_cache_boundary(self):
+        mixed_cache = [ArraysCache(1), KVCache()]
+        mixed_cache[0][0] = mx.ones((1, 2, 3))
+        keys = mx.arange(2).reshape(1, 1, 2, 1)
+        mixed_cache[1].update_and_fetch(keys, keys + 100)
+
+        class FakeBatchGenerator:
+            def extract_cache(self, uids):
+                self.extracted_uids = uids
+                return {123: (mixed_cache, [1, 2])}
+
+        batch_generator = FakeBatchGenerator()
+        batch_results = {123: {"cache_boundaries": {}}}
+        prompt_responses = [
+            types.SimpleNamespace(uid=123, end_of_prompt=True),
+            types.SimpleNamespace(uid=456, end_of_prompt=True),
+            types.SimpleNamespace(uid=789, end_of_prompt=False),
+        ]
+
+        _record_prompt_cache_boundaries(batch_results, batch_generator, prompt_responses)
+
+        self.assertEqual(batch_generator.extracted_uids, [123])
+        boundary = batch_results[123]["cache_boundaries"][2]
+        self.assertIsNot(boundary, mixed_cache)
+        mixed_cache[0][0] = mx.zeros((1, 2, 3))
+        tail = mx.ones((1, 1, 1, 1)) * 7
+        mixed_cache[1].update_and_fetch(tail, tail + 100)
+
+        self.assertTrue(mx.array_equal(boundary[0][0], mx.ones((1, 2, 3))))
+        restored_keys, restored_values = boundary[1].state
+        self.assertEqual(boundary[1].offset, 2)
+        self.assertTrue(mx.array_equal(restored_keys, keys))
+        self.assertTrue(mx.array_equal(restored_values, keys + 100))
+
     def test_serve_single_inserts_prompt_boundary_for_mixed_cache(self):
         model_key = ("fake-model", None, None)
         tokenizer = types.SimpleNamespace(

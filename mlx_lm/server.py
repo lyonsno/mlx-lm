@@ -438,6 +438,17 @@ def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
     )
 
 
+def _record_prompt_cache_boundaries(batch_results, batch_generator, prompt_responses):
+    prompt_boundary_ids = [
+        r.uid for r in prompt_responses if r.end_of_prompt and r.uid in batch_results
+    ]
+    boundary_caches = batch_generator.extract_cache(prompt_boundary_ids)
+    for uid, (cache, cache_key) in boundary_caches.items():
+        batch_results[uid]["cache_boundaries"][len(cache_key)] = (
+            make_prompt_cache_boundary(cache)
+        )
+
+
 class ResponseGenerator:
     def __init__(self, model_provider: ModelProvider, prompt_cache: LRUPromptCache):
         self.model_provider = model_provider
@@ -863,19 +874,9 @@ class ResponseGenerator:
                         if result["ctx"]._should_stop:
                             uids_to_remove.append(r.uid)
 
-                    prompt_boundary_ids = [
-                        r.uid
-                        for r in prompt_responses
-                        if r.end_of_prompt and r.uid in batch_results
-                    ]
-                    boundary_caches = batch_generator.extract_cache(
-                        prompt_boundary_ids
+                    _record_prompt_cache_boundaries(
+                        batch_results, batch_generator, prompt_responses
                     )
-                    for uid, (cache, cache_key) in boundary_caches.items():
-                        batch_results[uid]["cache_boundaries"][len(cache_key)] = (
-                            make_prompt_cache_boundary(cache)
-                        )
-                    del boundary_caches
 
                     # Save the caches at end of segments
                     eos_ids = [
