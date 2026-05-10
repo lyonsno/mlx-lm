@@ -333,6 +333,60 @@ class TestPromptCache(unittest.TestCase):
         self.assertTrue(mx.array_equal(restored_keys, keys))
         self.assertTrue(mx.array_equal(restored_values, keys + 100))
 
+    def test_prompt_boundary_restore_matches_cold_prefill_logits(self):
+        model, tokenizer = self.model, self.tokenizer
+        prefix = tokenizer.encode("this is a cached prefix", return_tensors="mlx")[0]
+        suffix = tokenizer.encode(" with a new suffix", return_tensors="mlx")[0]
+        cold_prompt = mx.concatenate([prefix, suffix])
+        cold_tok, cold_logits = next(generate_step(cold_prompt, model, max_tokens=1))
+
+        prompt_cache = make_prompt_cache(model)
+        boundaries = []
+
+        def boundary_callback(cache):
+            boundaries.append(make_prompt_cache_boundary(cache))
+
+        list(
+            generate_step(
+                prefix,
+                model,
+                prompt_cache=prompt_cache,
+                max_tokens=2,
+                prompt_cache_boundary_callback=boundary_callback,
+            )
+        )
+
+        self.assertEqual(len(boundaries), 1)
+        restore_prompt_cache_boundary(prompt_cache, boundaries[0])
+        cached_tok, cached_logits = next(
+            generate_step(suffix, model, prompt_cache=prompt_cache, max_tokens=1)
+        )
+
+        self.assertEqual(cached_tok, cold_tok)
+        self.assertTrue(mx.allclose(cached_logits, cold_logits, rtol=1e-4, atol=1e-4))
+
+    def test_full_current_cache_extension_matches_cold_prefill_logits(self):
+        model, tokenizer = self.model, self.tokenizer
+        prefix = tokenizer.encode("this prompt builds a live cache", return_tensors="mlx")[
+            0
+        ]
+        suffix = tokenizer.encode(" then appends a followup", return_tensors="mlx")[0]
+
+        prompt_cache = make_prompt_cache(model)
+        generated = list(
+            generate_step(prefix, model, prompt_cache=prompt_cache, max_tokens=2)
+        )
+        generated_tokens = mx.array([tok for tok, _ in generated], dtype=prefix.dtype)
+        cold_prompt = mx.concatenate([prefix, generated_tokens, suffix])
+        cold_tok, cold_logits = next(generate_step(cold_prompt, model, max_tokens=1))
+
+        cached_tok, cached_logits = next(
+            generate_step(suffix, model, prompt_cache=prompt_cache, max_tokens=1)
+        )
+
+        self.assertEqual(cached_tok, cold_tok)
+        self.assertTrue(mx.allclose(cached_logits, cold_logits, rtol=5e-2, atol=5e-2))
+
     def test_trim_cache_with_generate(self):
         model, tokenizer = self.model, self.tokenizer
         prompt = tokenizer.encode("this is a prompt", return_tensors="mlx")[0]
