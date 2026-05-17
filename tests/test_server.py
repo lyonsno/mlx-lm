@@ -121,6 +121,172 @@ class FakeSequenceStateMachine:
         return state, None, state
 
 
+class ServerProofCache:
+    def __init__(self, tokens=None):
+        self.tokens = list(tokens or [])
+
+    @property
+    def nbytes(self):
+        return len(self.tokens)
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        if n:
+            self.tokens = self.tokens[:-n]
+        return n
+
+
+class ServerProofDetokenizer:
+    last_segment = ""
+
+    def add_token(self, token):
+        self.last_segment = f"token-{token}"
+
+
+class ServerProofTokenizer:
+    has_chat_template = False
+    has_thinking = False
+    has_tool_calling = False
+    tool_parser = None
+    eos_token_id = 0
+    eos_token_ids = [0]
+
+    def __init__(self):
+        self.detokenizer = ServerProofDetokenizer()
+
+    def encode(self, text, add_special_tokens=False):
+        return list(text.encode())
+
+    def convert_ids_to_tokens(self, token):
+        return f"<tok-{token}>"
+
+
+class ServerProofModelProvider:
+    def __init__(self):
+        self.model = object()
+        self.tokenizer = ServerProofTokenizer()
+        self.model_key = ("server-proof-model", None, None)
+        self.draft_model = None
+        self.draft_model_key = None
+        self.is_batchable = True
+        self.cli_args = types.SimpleNamespace(
+            adapter_path=None,
+            chat_template=None,
+            use_default_chat_template=False,
+            trust_remote_code=False,
+            draft_model=None,
+            num_draft_tokens=0,
+            temp=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            max_tokens=1,
+            chat_template_args={},
+            model=None,
+            decode_concurrency=32,
+            prompt_concurrency=8,
+            prefill_step_size=2048,
+            prompt_cache_size=10,
+            prompt_cache_bytes=1 << 63,
+            prompt_cache_total_bytes=None,
+            allowed_origins=["*"],
+        )
+
+    def load_default(self):
+        return self.model, self.tokenizer
+
+    def load(self, *args, **kwargs):
+        return self.model, self.tokenizer
+
+
+class ServerProofBatchGenerator:
+    def __init__(self, *args, **kwargs):
+        self.records = {}
+        self._uid = 0
+
+    @property
+    def prompt_cache_nbytes(self):
+        return sum(
+            sum(c.nbytes for c in record["cache"])
+            for record in self.records.values()
+        )
+
+    def insert_segments(
+        self,
+        segments,
+        max_tokens=None,
+        caches=None,
+        all_tokens=None,
+        samplers=None,
+        logits_processors=None,
+        state_machines=None,
+    ):
+        uids = []
+        for i, request_segments in enumerate(segments):
+            uid = self._uid
+            self._uid += 1
+            cached_tokens = list((all_tokens or [[]])[i])
+            remaining_tokens = [
+                token for segment in request_segments for token in segment
+            ]
+            prompt = cached_tokens + remaining_tokens
+            cache = (caches or [None])[i] or [ServerProofCache()]
+            cache[0].tokens = list(prompt)
+            self.records[uid] = {
+                "prompt": prompt,
+                "cache": cache,
+                "state_machine": (state_machines or [FakeSequenceStateMachine()])[i],
+                "emitted": False,
+            }
+            uids.append(uid)
+        return uids
+
+    def extract_cache(self, uids):
+        return {
+            uid: (self.records[uid]["cache"], self.records[uid]["prompt"])
+            for uid in uids
+        }
+
+    def next(self):
+        pending = [
+            (uid, record)
+            for uid, record in self.records.items()
+            if not record["emitted"]
+        ]
+        if not pending:
+            return [], []
+        uid, record = pending[0]
+        record["emitted"] = True
+        response_token = 901 + uid
+        record["cache"][0].tokens = record["prompt"] + [response_token]
+        prompt_response = types.SimpleNamespace(
+            uid=uid,
+            progress=(len(record["prompt"]), len(record["prompt"])),
+            end_of_segment=False,
+            end_of_prompt=True,
+        )
+        gen_response = types.SimpleNamespace(
+            uid=uid,
+            token=response_token,
+            current_state="normal",
+            match_sequence=None,
+            logprobs={response_token: mx.array(0.0)},
+            finish_reason="length",
+            all_tokens=record["prompt"] + [response_token],
+            prompt_cache=record["cache"],
+        )
+        return [prompt_response], [gen_response]
+
+    def remove(self, uids):
+        for uid in uids:
+            self.records.pop(uid, None)
+
+    def close(self):
+        pass
+
+
 class TestProcessControlTokens(unittest.TestCase):
     @staticmethod
     def _r(text, state, match=None):
@@ -323,6 +489,90 @@ class TestResponseGeneratorPromptCache(unittest.TestCase):
         self.assertTrue(
             mx.array_equal(restored_values, mx.arange(2).reshape(1, 1, 2, 1) + 100)
         )
+
+
+class TestServerPromptCacheReceipts(unittest.TestCase):
+    def setUp(self):
+        self.response_generator = ResponseGenerator(
+            ServerProofModelProvider(), LRUPromptCache()
+        )
+        self.httpd = http.server.HTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(self.response_generator, *args, **kwargs),
+        )
+        self.port = self.httpd.server_port
+        self.server_thread = threading.Thread(target=self.httpd.serve_forever)
+        self.server_thread.daemon = True
+        self.server_thread.start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.server_thread.join()
+        self.response_generator.stop_and_join()
+
+    def _chat_completion(self, user_content, **overrides):
+        post_data = {
+            "model": "server-proof-model",
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Cache this long stable system prefix. " * 8,
+                },
+                {"role": "user", "content": user_content},
+            ],
+        }
+        post_data.update(overrides)
+        response = requests.post(
+            f"http://localhost:{self.port}/v1/chat/completions",
+            json=post_data,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def _assert_receipts_show_cold_then_warm_cache_hit(self, cold, warm):
+        cold_cached = cold["usage"]["prompt_tokens_details"]["cached_tokens"]
+        warm_cached = warm["usage"]["prompt_tokens_details"]["cached_tokens"]
+
+        self.assertEqual(cold_cached, 0)
+        self.assertGreater(warm_cached, 0)
+        self.assertLess(warm_cached, warm["usage"]["prompt_tokens"])
+        self.assertEqual(cold["usage"]["completion_tokens"], 1)
+        self.assertEqual(warm["usage"]["completion_tokens"], 1)
+        self.assertTrue(cold["choices"][0]["message"]["content"])
+        self.assertTrue(warm["choices"][0]["message"]["content"])
+
+    def test_single_chat_completion_reports_warm_cached_tokens(self):
+        def fake_stream_generate(
+            *, prompt, prompt_cache, prompt_cache_boundary_callback, **_
+        ):
+            prompt_cache[0].tokens.extend(prompt)
+            prompt_cache_boundary_callback(prompt_cache)
+            prompt_cache[0].tokens.append(777)
+            yield types.SimpleNamespace(
+                text="x",
+                token=777,
+                logprobs={777: mx.array(0.0)},
+                finish_reason="length",
+            )
+
+        with (
+            patch("mlx_lm.server.make_prompt_cache", return_value=[ServerProofCache()]),
+            patch("mlx_lm.server.stream_generate", fake_stream_generate),
+        ):
+            cold = self._chat_completion("repeatable prefix", seed=123)
+            warm = self._chat_completion("repeatable prefix with suffix", seed=123)
+
+        self._assert_receipts_show_cold_then_warm_cache_hit(cold, warm)
+
+    def test_batchable_chat_completion_reports_warm_cached_tokens(self):
+        with patch("mlx_lm.server.BatchGenerator", ServerProofBatchGenerator):
+            cold = self._chat_completion("repeatable prefix")
+            warm = self._chat_completion("repeatable prefix with suffix")
+
+        self._assert_receipts_show_cold_then_warm_cache_hit(cold, warm)
 
 
 class TestServer(unittest.TestCase):
