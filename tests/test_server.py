@@ -202,9 +202,21 @@ class ServerProofModelProvider:
 
 
 class ServerProofBatchGenerator:
+    instances = []
+    min_pending_before_generation = 1
+
+    @classmethod
+    def reset_probes(cls, *, min_pending_before_generation=1):
+        cls.instances = []
+        cls.min_pending_before_generation = min_pending_before_generation
+
     def __init__(self, *args, **kwargs):
         self.records = {}
         self._uid = 0
+        self.insert_call_sizes = []
+        self.next_pending_sizes = []
+        self.generated_batch_sizes = []
+        type(self).instances.append(self)
 
     @property
     def prompt_cache_nbytes(self):
@@ -223,6 +235,7 @@ class ServerProofBatchGenerator:
         logits_processors=None,
         state_machines=None,
     ):
+        self.insert_call_sizes.append(len(segments))
         uids = []
         for i, request_segments in enumerate(segments):
             uid = self._uid
@@ -255,29 +268,40 @@ class ServerProofBatchGenerator:
             for uid, record in self.records.items()
             if not record["emitted"]
         ]
+        self.next_pending_sizes.append(len(pending))
         if not pending:
             return [], []
-        uid, record = pending[0]
-        record["emitted"] = True
-        response_token = 901 + uid
-        record["cache"][0].tokens = record["prompt"] + [response_token]
-        prompt_response = types.SimpleNamespace(
-            uid=uid,
-            progress=(len(record["prompt"]), len(record["prompt"])),
-            end_of_segment=False,
-            end_of_prompt=True,
-        )
-        gen_response = types.SimpleNamespace(
-            uid=uid,
-            token=response_token,
-            current_state="normal",
-            match_sequence=None,
-            logprobs={response_token: mx.array(0.0)},
-            finish_reason="length",
-            all_tokens=record["prompt"] + [response_token],
-            prompt_cache=record["cache"],
-        )
-        return [prompt_response], [gen_response]
+        if len(pending) < type(self).min_pending_before_generation:
+            return [], []
+
+        self.generated_batch_sizes.append(len(pending))
+        prompt_responses = []
+        gen_responses = []
+        for uid, record in pending:
+            record["emitted"] = True
+            response_token = 901 + uid
+            record["cache"][0].tokens = record["prompt"] + [response_token]
+            prompt_responses.append(
+                types.SimpleNamespace(
+                    uid=uid,
+                    progress=(len(record["prompt"]), len(record["prompt"])),
+                    end_of_segment=False,
+                    end_of_prompt=True,
+                )
+            )
+            gen_responses.append(
+                types.SimpleNamespace(
+                    uid=uid,
+                    token=response_token,
+                    current_state="normal",
+                    match_sequence=None,
+                    logprobs={response_token: mx.array(0.0)},
+                    finish_reason="length",
+                    all_tokens=record["prompt"] + [response_token],
+                    prompt_cache=record["cache"],
+                )
+            )
+        return prompt_responses, gen_responses
 
     def remove(self, uids):
         for uid in uids:
@@ -493,6 +517,7 @@ class TestResponseGeneratorPromptCache(unittest.TestCase):
 
 class TestServerPromptCacheReceipts(unittest.TestCase):
     def setUp(self):
+        ServerProofBatchGenerator.reset_probes()
         self.response_generator = ResponseGenerator(
             ServerProofModelProvider(), LRUPromptCache()
         )
@@ -573,6 +598,53 @@ class TestServerPromptCacheReceipts(unittest.TestCase):
             warm = self._chat_completion("repeatable prefix with suffix")
 
         self._assert_receipts_show_cold_then_warm_cache_hit(cold, warm)
+
+    def test_batchable_chat_completions_are_admitted_before_first_drains(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.server_thread.join()
+        self.httpd = http.server.ThreadingHTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(self.response_generator, *args, **kwargs),
+        )
+        self.port = self.httpd.server_port
+        self.server_thread = threading.Thread(target=self.httpd.serve_forever)
+        self.server_thread.daemon = True
+        self.server_thread.start()
+
+        ServerProofBatchGenerator.reset_probes(min_pending_before_generation=2)
+        start = threading.Barrier(3)
+        results = Queue()
+
+        def request_worker(content):
+            start.wait(timeout=5)
+            try:
+                results.put(self._chat_completion(content))
+            except Exception as exc:
+                results.put(exc)
+
+        workers = [
+            threading.Thread(target=request_worker, args=(f"co-batch request {i}",))
+            for i in range(2)
+        ]
+        with patch("mlx_lm.server.BatchGenerator", ServerProofBatchGenerator):
+            for worker in workers:
+                worker.start()
+            start.wait(timeout=5)
+            for worker in workers:
+                worker.join(timeout=5)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        responses = [results.get_nowait() for _ in workers]
+        for response in responses:
+            if isinstance(response, Exception):
+                raise response
+            self.assertEqual(response["usage"]["completion_tokens"], 1)
+
+        self.assertEqual(len(ServerProofBatchGenerator.instances), 1)
+        batch_generator = ServerProofBatchGenerator.instances[0]
+        self.assertGreaterEqual(max(batch_generator.next_pending_sizes), 2)
+        self.assertIn(2, batch_generator.generated_batch_sizes)
 
 
 class TestServer(unittest.TestCase):
